@@ -1,0 +1,39 @@
+# Core deep learning
+torch
+torchvision
+torchaudio
+
+# Transformer models
+transformers>=4.40.0
+accelerate>=0.28.0
+sentencepiece
+protobuf
+
+# Parameter-efficient fine-tuning (LoRA/QLoRA)
+peft>=0.10.0
+bitsandbytes>=0.43.0
+
+# Dataset processing
+datasets>=2.18.0
+
+# Evaluation
+sacrebleu
+jiwer
+
+# Sentence embeddings (cho RL subset, SBERT)
+sentence-transformers
+
+# Dedup bằng MinHash
+datasketch
+
+# Utilities
+tqdm
+numpy
+scipy
+scikit-learn
+
+# Logging (optional)
+wandb
+
+# Avoid warnings
+psutil
