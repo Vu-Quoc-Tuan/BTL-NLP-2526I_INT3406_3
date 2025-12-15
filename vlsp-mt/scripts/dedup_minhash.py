@@ -87,7 +87,7 @@ def deduplicate_minhash(
     k: int = 5,
     dedup_by: str = "both",
     rep_strategy: str = "longest",
-    num_workers: int = 4
+    num_workers: int = 12
 ) -> Tuple[List[int], dict]:
     """
     Deduplicate pairs using MinHash LSH.

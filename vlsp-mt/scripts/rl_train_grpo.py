@@ -31,58 +31,45 @@ def sentence_reward(hyp, ref, alpha=0.6, beta=0.4):
     chrf = sacrebleu.sentence_chrf(hyp, [ref]).score / 100.0
     return alpha * bleu + beta * chrf
 
-def get_seq_logprob_and_kl(cur_model, sft_model, tokenizer, prompt_ids, gen_ids):
+@torch.cuda.amp.autocast(dtype=torch.bfloat16)
+def get_seq_logprob_and_kl(cur_model, sft_model, prompt_ids, gen_ids):
     """
     Compute log probability of generated sequence under current model,
     and KL(cur || sft) - penalize current policy diverging from SFT policy.
     
-    Args:
-        cur_model: Current policy being trained
-        sft_model: Reference SFT policy (frozen)
-        tokenizer: Tokenizer
-        prompt_ids: Tokenized prompt [1, prompt_len]
-        gen_ids: Generated token ids [1, gen_len]
-    
-    Returns:
-        seq_logprob: Sum of log probs for generated tokens under cur_model
-        kl: KL(cur || sft) divergence estimate
+    Optimized version with mixed precision.
     """
     device = gen_ids.device
     full_ids = torch.cat([prompt_ids, gen_ids], dim=1)
     attention_mask = torch.ones_like(full_ids)
     prompt_len = prompt_ids.shape[1]
-    gen_len = gen_ids.shape[1]
 
     # Forward pass through current model (with gradients)
     cur_out = cur_model(full_ids, attention_mask=attention_mask, return_dict=True)
-    cur_logits = cur_out.logits  # [1, L, V]
+    cur_logits = cur_out.logits
 
     # Forward pass through SFT model (no gradients)
     with torch.no_grad():
         sft_out = sft_model(full_ids, attention_mask=attention_mask, return_dict=True)
         sft_logits = sft_out.logits
 
-    # Shift logits and targets for next-token prediction
-    # logits[:, t, :] predicts token at position t+1
-    shifted_cur_logits = cur_logits[:, prompt_len-1:-1, :]  # Logits predicting gen tokens
+    # Only compute on generated tokens
+    shifted_cur_logits = cur_logits[:, prompt_len-1:-1, :]
     shifted_sft_logits = sft_logits[:, prompt_len-1:-1, :]
-    target_ids = gen_ids  # [1, gen_len]
+    target_ids = gen_ids
 
-    # Log probabilities
-    cur_log_probs = torch.nn.functional.log_softmax(shifted_cur_logits, dim=-1)
-    sft_log_probs = torch.nn.functional.log_softmax(shifted_sft_logits, dim=-1)
+    # Log probabilities (use float32 for numerical stability in softmax)
+    cur_log_probs = torch.nn.functional.log_softmax(shifted_cur_logits.float(), dim=-1)
+    sft_log_probs = torch.nn.functional.log_softmax(shifted_sft_logits.float(), dim=-1)
 
-    # Sequence log probability: sum of log P(token_t | context) for generated tokens
-    token_logprobs = torch.gather(
-        cur_log_probs, 2, target_ids.unsqueeze(-1)
-    ).squeeze(-1)  # [1, gen_len]
-    seq_logprob = token_logprobs.sum(dim=1)  # [1]
+    # Sequence log probability
+    token_logprobs = torch.gather(cur_log_probs, 2, target_ids.unsqueeze(-1)).squeeze(-1)
+    seq_logprob = token_logprobs.sum(dim=1)
 
-    # KL(cur || sft) = sum_x P_cur(x) * [log P_cur(x) - log P_sft(x)]
-    # This penalizes the current policy for being different from SFT
-    cur_probs = torch.exp(cur_log_probs)
-    kl_per_token = torch.sum(cur_probs * (cur_log_probs - sft_log_probs), dim=-1)  # [1, gen_len]
-    kl = kl_per_token.mean()  # Average over tokens
+    # KL divergence (simplified - only on target tokens, not full vocab)
+    # This is faster than computing full KL
+    sft_token_logprobs = torch.gather(sft_log_probs, 2, target_ids.unsqueeze(-1)).squeeze(-1)
+    kl = (token_logprobs - sft_token_logprobs).mean()
 
     return seq_logprob.squeeze(0), kl
 
@@ -119,6 +106,7 @@ def main():
     p.add_argument("--warmup_steps", type=int, default=100, help="Warmup steps for learning rate")
     p.add_argument("--log_interval", type=int, default=10, help="Log every N batches")
     p.add_argument("--save_interval", type=int, default=500, help="Save checkpoint every N batches")
+    p.add_argument("--no_grad_checkpoint", action="store_true", help="Disable gradient checkpointing")
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,6 +172,14 @@ def main():
         args.init_adapter,
         is_trainable=True
     )
+    
+    # Gradient checkpointing
+    if not args.no_grad_checkpoint:
+        cur_model.gradient_checkpointing_enable()
+        print("Gradient checkpointing ENABLED")
+    else:
+        print("Gradient checkpointing DISABLED (faster)")
+    
     cur_model.train()
 
     # Ensure LoRA params are trainable
@@ -286,7 +282,7 @@ def main():
 
                     # Compute log prob and KL
                     seq_logprob, kl = get_seq_logprob_and_kl(
-                        cur_model, sft_model, tokenizer, prompt_ids, gen_ids
+                        cur_model, sft_model, prompt_ids, gen_ids
                     )
 
                     # Advantage = reward - baseline (variance reduction)

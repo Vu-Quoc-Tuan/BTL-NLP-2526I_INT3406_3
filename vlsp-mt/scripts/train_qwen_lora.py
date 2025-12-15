@@ -210,6 +210,8 @@ def main():
     p.add_argument("--early_stopping_patience", type=int, default=3,
                    help="Early stopping patience (0 to disable)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
+    p.add_argument("--no_grad_checkpoint", action="store_true",
+                   help="Disable gradient checkpointing (faster but uses more VRAM)")
     
     args = p.parse_args()
     
@@ -262,9 +264,13 @@ def main():
         attn_implementation=attn_impl,
     )
     
-    # Enable gradient checkpointing for memory efficiency
-    model.gradient_checkpointing_enable()
-    model.config.use_cache = False  # Required for gradient checkpointing
+    # Gradient checkpointing: trade speed for memory
+    if not args.no_grad_checkpoint:
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+        print("Gradient checkpointing ENABLED (slower but less VRAM)")
+    else:
+        print("Gradient checkpointing DISABLED (faster but more VRAM)")
 
 
     # ============================================================
@@ -374,8 +380,8 @@ def main():
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         dataloader_prefetch_factor=2,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        gradient_checkpointing=not args.no_grad_checkpoint,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if not args.no_grad_checkpoint else None,
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
         torch_compile=False,  # Set True if PyTorch 2.0+ for extra speed
         
