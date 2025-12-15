@@ -54,28 +54,36 @@ def tokenize_example(example, tokenizer, direction, max_len):
     src, tgt = example["src"], example["tgt"]
     prompt = build_prompt_en2vi(src) if direction == "en2vi" else build_prompt_vi2en(src)
     
-    # Tokenize prompt and target separately to get exact boundary
+    # Tokenize prompt (limit to half of max_len to leave room for target)
+    max_prompt_len = max_len // 2
     prompt_ids = tokenizer(
         prompt, 
         add_special_tokens=True,
         truncation=True,
-        max_length=max_len
+        max_length=max_prompt_len
     )["input_ids"]
     
     # Target with space prefix and EOS
+    max_target_len = max_len - len(prompt_ids)
     target_ids = tokenizer(
         " " + tgt + tokenizer.eos_token,
         add_special_tokens=False,
         truncation=True,
-        max_length=max_len - len(prompt_ids)
+        max_length=max(1, max_target_len)  # At least 1 token
     )["input_ids"]
     
-    # Concatenate
+    # Concatenate and ensure total length <= max_len
     input_ids = prompt_ids + target_ids
+    if len(input_ids) > max_len:
+        input_ids = input_ids[:max_len]
+    
+    prompt_len = len(prompt_ids)
+    target_len = len(input_ids) - prompt_len
+    
     attention_mask = [1] * len(input_ids)
     
     # Labels: -100 for prompt tokens (no loss), actual ids for target
-    labels = [-100] * len(prompt_ids) + target_ids
+    labels = [-100] * prompt_len + input_ids[prompt_len:]
     
     # Pad to max_len
     pad_len = max_len - len(input_ids)
@@ -382,14 +390,10 @@ def main():
         print(f"Early stopping enabled with patience={args.early_stopping_patience}")
 
     # ============================================================
-    # Data collator
+    # Data collator - simple default collator since we already padded
     # ============================================================
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        padding=False,
-        return_tensors="pt"
-    )
+    from transformers import default_data_collator
+    data_collator = default_data_collator
 
 
     # ============================================================
