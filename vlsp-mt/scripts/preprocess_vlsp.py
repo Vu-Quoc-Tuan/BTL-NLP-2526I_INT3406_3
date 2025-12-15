@@ -287,11 +287,11 @@ def main():
         )
         
         # Save splits
-        for split_name, split_data in [("train", train), ("dev", dev), ("test", test)]:
+        for split_name, split_pairs in [("train", train), ("dev", dev), ("test", test)]:
             src_out = os.path.join(args.out_dir, f"{split_name}.{args.src_lang}")
             tgt_out = os.path.join(args.out_dir, f"{split_name}.{args.tgt_lang}")
-            save_parallel(split_data, src_out, tgt_out)
-            print_stats(split_name.capitalize(), split_data)
+            save_parallel(split_pairs, src_out, tgt_out)
+            print_stats(split_name.capitalize(), split_pairs)
 
     # Summary
     print("\n" + "="*60)

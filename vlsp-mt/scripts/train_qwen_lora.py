@@ -229,12 +229,23 @@ def main():
     dtype = torch.bfloat16 if use_bf16 else torch.float16
     print(f"Using dtype: {dtype}")
 
+    # Check if flash_attn is available
+    attn_impl = None
+    if torch.cuda.is_available():
+        try:
+            import flash_attn
+            attn_impl = "flash_attention_2"
+            print("Using Flash Attention 2")
+        except ImportError:
+            attn_impl = "sdpa"  # Use PyTorch's scaled dot product attention
+            print("Flash Attention not installed, using SDPA")
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         trust_remote_code=True,
         device_map="auto",
         torch_dtype=dtype,
-        attn_implementation="flash_attention_2" if torch.cuda.is_available() else None,
+        attn_implementation=attn_impl,
     )
     
     # Enable gradient checkpointing for memory efficiency
