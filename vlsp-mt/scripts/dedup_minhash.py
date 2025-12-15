@@ -73,13 +73,21 @@ def select_representative(
 
 
 
+def _compute_minhash_worker(args):
+    """Worker function for parallel MinHash computation."""
+    idx, text, num_perm, k = args
+    m = build_minhash(text, num_perm=num_perm, k=k)
+    return idx, m
+
+
 def deduplicate_minhash(
     pairs: List[Tuple[str, str]],
     threshold: float = 0.8,
     num_perm: int = 128,
     k: int = 5,
     dedup_by: str = "both",
-    rep_strategy: str = "longest"
+    rep_strategy: str = "longest",
+    num_workers: int = 4
 ) -> Tuple[List[int], dict]:
     """
     Deduplicate pairs using MinHash LSH.
@@ -91,47 +99,85 @@ def deduplicate_minhash(
         k: Shingle size
         dedup_by: "src", "tgt", or "both"
         rep_strategy: How to select representative from cluster
+        num_workers: Number of parallel workers for MinHash computation
     
     Returns:
         List of indices to keep, and statistics dict
     """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing
+    
     n = len(pairs)
     
-    # Build LSH index
-    print(f"Building MinHash LSH index (threshold={threshold}, k={k})...")
-    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
-    
-    minhashes = []
-    for i, (src, tgt) in enumerate(tqdm(pairs, desc="Computing MinHash")):
+    # Prepare texts for hashing
+    print(f"Preparing texts for hashing...")
+    texts = []
+    for src, tgt in pairs:
         if dedup_by == "src":
-            key_text = src
+            texts.append(src)
         elif dedup_by == "tgt":
-            key_text = tgt
+            texts.append(tgt)
         else:  # both
-            key_text = src + " ||| " + tgt
+            texts.append(src + " ||| " + tgt)
+    
+    # Build MinHash signatures (parallel for large datasets)
+    print(f"Building MinHash signatures (threshold={threshold}, k={k})...")
+    minhashes = [None] * n
+    
+    if n > 10000 and num_workers > 1:
+        # Use multiprocessing for large datasets
+        num_workers = min(num_workers, multiprocessing.cpu_count())
+        print(f"Using {num_workers} workers for parallel processing...")
         
-        m = build_minhash(key_text, num_perm=num_perm, k=k)
-        minhashes.append(m)
+        work_items = [(i, texts[i], num_perm, k) for i in range(n)]
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_compute_minhash_worker, item): item[0] 
+                      for item in work_items}
+            
+            for future in tqdm(as_completed(futures), total=n, desc="Computing MinHash"):
+                idx, m = future.result()
+                minhashes[idx] = m
+    else:
+        # Sequential for small datasets (less overhead)
+        for i, text in enumerate(tqdm(texts, desc="Computing MinHash")):
+            minhashes[i] = build_minhash(text, num_perm=num_perm, k=k)
+    
+    # Build LSH index
+    print("Building LSH index...")
+    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    for i, m in enumerate(tqdm(minhashes, desc="Indexing")):
         lsh.insert(f"m{i}", m)
     
-    # Find clusters
+    # Find clusters using Union-Find for efficiency
     print("Finding duplicate clusters...")
-    visited = set()
-    clusters = []
+    parent = list(range(n))
     
+    def find(x):
+        if parent[x] != x:
+            parent[x] = find(parent[x])  # Path compression
+        return parent[x]
+    
+    def union(x, y):
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+    
+    # Query and union similar items
     for i in tqdm(range(n), desc="Clustering"):
-        if i in visited:
-            continue
-        
-        # Query for similar items
         candidates = lsh.query(minhashes[i])
-        cluster_indices = [int(c[1:]) for c in candidates]
-        
-        # Mark all as visited
-        for idx in cluster_indices:
-            visited.add(idx)
-        
-        clusters.append(cluster_indices)
+        for c in candidates:
+            j = int(c[1:])
+            union(i, j)
+    
+    # Group by root
+    from collections import defaultdict
+    clusters_dict = defaultdict(list)
+    for i in range(n):
+        root = find(i)
+        clusters_dict[root].append(i)
+    
+    clusters = list(clusters_dict.values())
     
     # Select representatives
     keep_indices = []
@@ -141,6 +187,9 @@ def deduplicate_minhash(
     
     # Sort to maintain original order
     keep_indices = sorted(keep_indices)
+    
+    # Clear minhashes to free memory
+    del minhashes
     
     # Statistics
     cluster_sizes = [len(c) for c in clusters]

@@ -144,7 +144,7 @@ def main():
     p.add_argument("--do_sample", action="store_true", help="Use sampling instead of beam search")
     p.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
     p.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling")
-    p.add_argument("--num_beams", type=int, default=4, help="Beam search beams")
+    p.add_argument("--num_beams", type=int, default=1, help="Beam search beams (1=greedy, faster)")
     
     args = p.parse_args()
 
@@ -163,11 +163,21 @@ def main():
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float16
     
+    # Check for flash attention
+    attn_impl = None
+    if torch.cuda.is_available():
+        try:
+            import flash_attn
+            attn_impl = "flash_attention_2"
+        except ImportError:
+            attn_impl = "sdpa"
+    
     base = AutoModelForCausalLM.from_pretrained(
         args.model_name, 
         trust_remote_code=True, 
         device_map="auto",
-        torch_dtype=dtype
+        torch_dtype=dtype,
+        attn_implementation=attn_impl,
     )
     model = PeftModel.from_pretrained(base, args.adapter_path)
     model.eval()

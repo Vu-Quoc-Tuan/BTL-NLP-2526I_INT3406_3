@@ -130,16 +130,38 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # ============================================================
-    # Load SFT Model (Reference Policy - Frozen)
+    # Load Base Model (shared between SFT and Current)
     # ============================================================
-    print("Loading SFT reference model...")
-    sft_base = AutoModelForCausalLM.from_pretrained(
+    print("Loading base model...")
+    
+    # Check for flash attention
+    attn_impl = None
+    if torch.cuda.is_available():
+        try:
+            import flash_attn
+            attn_impl = "flash_attention_2"
+            print("Using Flash Attention 2")
+        except ImportError:
+            attn_impl = "sdpa"
+            print("Using SDPA")
+    
+    base_model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         trust_remote_code=True,
         device_map="auto",
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.bfloat16,
+        attn_implementation=attn_impl,
     )
-    sft_model = PeftModel.from_pretrained(sft_base, args.sft_adapter)
+    
+    # Freeze base model
+    for param in base_model.parameters():
+        param.requires_grad = False
+    
+    # ============================================================
+    # Load SFT Model (Reference Policy - Frozen)
+    # ============================================================
+    print("Loading SFT adapter (frozen reference)...")
+    sft_model = PeftModel.from_pretrained(base_model, args.sft_adapter)
     sft_model.eval()
     for param in sft_model.parameters():
         param.requires_grad = False
@@ -147,13 +169,15 @@ def main():
 
     # ============================================================
     # Load Current Model (Policy to be trained)
+    # Note: We need a separate base for cur_model since PEFT modifies the base
     # ============================================================
     print("Loading trainable model...")
     cur_base = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         trust_remote_code=True,
         device_map="auto",
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.bfloat16,
+        attn_implementation=attn_impl,
     )
     cur_model = PeftModel.from_pretrained(
         cur_base,
@@ -234,7 +258,7 @@ def main():
                 sample_rewards_list = []
 
                 for _ in range(args.num_samples):
-                    # Generate with sampling
+                    # Generate with sampling (use_cache=True for faster generation)
                     with torch.no_grad():
                         gen_out = cur_model.generate(
                             prompt_ids,
@@ -244,6 +268,7 @@ def main():
                             max_new_tokens=args.max_new_tokens,
                             pad_token_id=tokenizer.pad_token_id,
                             eos_token_id=tokenizer.eos_token_id,
+                            use_cache=True,
                         )
 
                     # Extract generated tokens (exclude prompt)

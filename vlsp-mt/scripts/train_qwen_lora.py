@@ -133,33 +133,39 @@ class NEFTuneTrainer(Trainer):
     def __init__(self, neftune_noise_alpha=5.0, **kwargs):
         super().__init__(**kwargs)
         self.neftune_noise_alpha = neftune_noise_alpha
+        self._neftune_hook_handle = None
     
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # Get embeddings
-        if hasattr(model, 'base_model'):
-            # PEFT model
-            embed_layer = model.base_model.model.model.embed_tokens
-        else:
-            embed_layer = model.model.embed_tokens
+    def _setup_neftune_hook(self):
+        """Setup hook once at the beginning of training."""
+        if self._neftune_hook_handle is not None:
+            return
         
-        # Hook to add noise
+        # Get embeddings layer
+        if hasattr(self.model, 'base_model'):
+            embed_layer = self.model.base_model.model.model.embed_tokens
+        else:
+            embed_layer = self.model.model.embed_tokens
+        
+        neftune_alpha = self.neftune_noise_alpha
+        
         def neftune_hook(module, input, output):
-            if self.model.training:
-                dims = torch.tensor(output.size(1) * output.size(2), device=output.device)
-                mag_norm = self.neftune_noise_alpha / torch.sqrt(dims)
-                noise = torch.zeros_like(output).uniform_(-1, 1) * mag_norm
-                return output + noise
+            if module.training:
+                # Faster: avoid creating tensor for dims
+                seq_len, hidden_dim = output.size(1), output.size(2)
+                mag_norm = neftune_alpha / (seq_len * hidden_dim) ** 0.5
+                output = output + torch.zeros_like(output).uniform_(-mag_norm, mag_norm)
             return output
         
-        # Register hook
-        handle = embed_layer.register_forward_hook(neftune_hook)
-        
+        self._neftune_hook_handle = embed_layer.register_forward_hook(neftune_hook)
+    
+    def train(self, *args, **kwargs):
+        self._setup_neftune_hook()
         try:
-            loss = super().compute_loss(model, inputs, return_outputs, **kwargs)
+            return super().train(*args, **kwargs)
         finally:
-            handle.remove()
-        
-        return loss
+            if self._neftune_hook_handle:
+                self._neftune_hook_handle.remove()
+                self._neftune_hook_handle = None
 
 
 def main():
@@ -299,7 +305,6 @@ def main():
         batched=False,
         remove_columns=["src", "tgt"],
         desc="Tokenizing train",
-        num_proc=4,
     )
     train_tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
@@ -315,7 +320,6 @@ def main():
             batched=False,
             remove_columns=["src", "tgt"],
             desc="Tokenizing val",
-            num_proc=4,
         )
         eval_tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
@@ -366,11 +370,14 @@ def main():
         metric_for_best_model="eval_loss" if eval_tokenized else None,
         greater_is_better=False,
         
-        # Performance
+        # Performance optimizations for A100
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
+        dataloader_prefetch_factor=2,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
+        torch_compile=False,  # Set True if PyTorch 2.0+ for extra speed
         
         # Other
         remove_unused_columns=False,
