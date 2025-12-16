@@ -27,6 +27,40 @@ def build_prompt_vi2en(src):
     )
 
 
+def postprocess_vi(text: str) -> str:
+    """Post-process Vietnamese translation."""
+    import re
+    # Chuẩn hóa dấu câu (xóa space trước dấu câu)
+    text = re.sub(r'\s+([.,!?;:])', r'\1', text)
+    # Chuẩn hóa quotes
+    text = re.sub(r'"\s+', '"', text)
+    text = re.sub(r'\s+"', '"', text)
+    # Xóa space thừa
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Capitalize đầu câu
+    if text:
+        text = text[0].upper() + text[1:]
+    return text
+
+
+def postprocess_en(text: str) -> str:
+    """Post-process English translation."""
+    import re
+    # Chuẩn hóa dấu câu
+    text = re.sub(r'\s+([.,!?;:])', r'\1', text)
+    # Chuẩn hóa quotes
+    text = re.sub(r'"\s+', '"', text)
+    text = re.sub(r'\s+"', '"', text)
+    # Xóa space thừa
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Capitalize đầu câu
+    if text:
+        text = text[0].upper() + text[1:]
+    # Chuẩn hóa I'm, don't, etc.
+    text = re.sub(r"\bi\b", "I", text)
+    return text
+
+
 def extract_translation(full_text: str, prompt: str) -> str:
     """Extract translation from generated text, handling various edge cases."""
     # Method 1: Find the prompt and take everything after
@@ -80,6 +114,8 @@ def generate_batch(
     temperature: float,
     top_p: float,
     num_beams: int,
+    length_penalty: float,
+    repetition_penalty: float,
     device
 ) -> list:
     """Generate translations for a batch of prompts."""
@@ -111,6 +147,8 @@ def generate_batch(
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 num_beams=num_beams,
+                length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 use_cache=True,
@@ -147,7 +185,9 @@ def main():
     p.add_argument("--do_sample", action="store_true", help="Use sampling instead of beam search")
     p.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
     p.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling")
-    p.add_argument("--num_beams", type=int, default=1, help="Beam search beams (1=greedy, faster)")
+    p.add_argument("--num_beams", type=int, default=4, help="Beam search beams (1=greedy, 4-5 recommended)")
+    p.add_argument("--length_penalty", type=float, default=1.0, help="Length penalty (>1 longer, <1 shorter)")
+    p.add_argument("--repetition_penalty", type=float, default=1.1, help="Repetition penalty to avoid repeating")
     
     args = p.parse_args()
 
@@ -196,6 +236,7 @@ def main():
     print(f"Loaded {len(lines)} sentences from {args.input}")
     
     build_prompt = build_prompt_en2vi if args.direction == "en2vi" else build_prompt_vi2en
+    postprocess = postprocess_vi if args.direction == "en2vi" else postprocess_en
 
     # ============================================================
     # Generate
@@ -223,16 +264,19 @@ def main():
                 temperature=args.temperature,
                 top_p=args.top_p,
                 num_beams=args.num_beams,
+                length_penalty=args.length_penalty,
+                repetition_penalty=args.repetition_penalty,
                 device=device
             )
         else:
             translations = []
         
-        # Reconstruct with empty lines
+        # Reconstruct with empty lines + post-process
         batch_results = [""] * len(batch_lines)
         for idx, trans in zip(batch_indices, translations):
-            batch_results[idx] = trans
+            batch_results[idx] = postprocess(trans)
         
+
         all_translations.extend(batch_results)
 
     # ============================================================
