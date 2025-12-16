@@ -104,7 +104,6 @@ def deduplicate_minhash(
     Returns:
         List of indices to keep, and statistics dict
     """
-    from concurrent.futures import ProcessPoolExecutor, as_completed
     import multiprocessing
     
     n = len(pairs)
@@ -131,12 +130,13 @@ def deduplicate_minhash(
         
         work_items = [(i, texts[i], num_perm, k) for i in range(n)]
         
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(_compute_minhash_worker, item): item[0] 
-                      for item in work_items}
-            
-            for future in tqdm(as_completed(futures), total=n, desc="Computing MinHash"):
-                idx, m = future.result()
+        # Use Pool.imap_unordered for better tqdm compatibility
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            for idx, m in tqdm(
+                pool.imap_unordered(_compute_minhash_worker, work_items, chunksize=1000),
+                total=n,
+                desc="Computing MinHash"
+            ):
                 minhashes[idx] = m
     else:
         # Sequential for small datasets (less overhead)
