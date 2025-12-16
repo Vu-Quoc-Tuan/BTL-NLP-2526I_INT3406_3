@@ -4,13 +4,31 @@ Evaluate machine translation quality using multiple metrics:
 - BLEU (SacreBLEU)
 - chrF / chrF++
 - TER (Translation Edit Rate)
-- COMET (optional, neural metric)
+- METEOR
+- Gemini Score (LLM-as-judge, optional)
 """
 import argparse
 import json
 import os
+import random
 import sacrebleu
 from sacrebleu.metrics import BLEU, CHRF, TER
+
+# METEOR requires nltk
+try:
+    import nltk
+    from nltk.translate.meteor_score import meteor_score
+    from nltk.tokenize import word_tokenize
+    METEOR_AVAILABLE = True
+except ImportError:
+    METEOR_AVAILABLE = False
+
+# Gemini requires google-generativeai
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
 
 
 def load_file(path: str) -> list:
@@ -20,7 +38,122 @@ def load_file(path: str) -> list:
     return lines
 
 
-def compute_metrics(hyp: list, ref: list, src: list = None) -> dict:
+def compute_meteor(hyp: list, ref: list) -> float:
+    """Compute corpus-level METEOR score."""
+    if not METEOR_AVAILABLE:
+        return None
+    
+    # Ensure NLTK data is available
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+    try:
+        nltk.data.find('corpora/wordnet')
+    except LookupError:
+        nltk.download('wordnet', quiet=True)
+    try:
+        nltk.data.find('corpora/omw-1.4')
+    except LookupError:
+        nltk.download('omw-1.4', quiet=True)
+    
+    scores = []
+    for h, r in zip(hyp, ref):
+        # Tokenize
+        hyp_tokens = word_tokenize(h.lower())
+        ref_tokens = word_tokenize(r.lower())
+        # METEOR expects reference as list of tokens
+        score = meteor_score([ref_tokens], hyp_tokens)
+        scores.append(score)
+    
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def compute_gemini_score(
+    hyp: list, 
+    ref: list, 
+    src: list,
+    api_key: str,
+    sample_size: int = 100,
+    direction: str = "en2vi"
+) -> dict:
+    """
+    Use Gemini as judge to evaluate translation quality.
+    
+    Returns average score (1-5) and detailed breakdown.
+    """
+    if not GEMINI_AVAILABLE:
+        return None
+    
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # Sample if dataset is large
+    indices = list(range(len(hyp)))
+    if len(indices) > sample_size:
+        random.seed(42)
+        indices = random.sample(indices, sample_size)
+    
+    src_lang = "English" if direction == "en2vi" else "Vietnamese"
+    tgt_lang = "Vietnamese" if direction == "en2vi" else "English"
+    
+    prompt_template = f"""You are an expert translator evaluating {src_lang} to {tgt_lang} medical translation quality.
+
+Rate the translation on a scale of 1-5:
+1 = Very poor (major errors, incomprehensible)
+2 = Poor (significant errors affecting meaning)
+3 = Acceptable (minor errors, meaning preserved)
+4 = Good (fluent, accurate, minor issues)
+5 = Excellent (perfect or near-perfect)
+
+Source ({src_lang}): {{src}}
+Reference ({tgt_lang}): {{ref}}
+Translation ({tgt_lang}): {{hyp}}
+
+Respond with ONLY a JSON object:
+{{"score": <1-5>, "reason": "<brief explanation>"}}"""
+
+    scores = []
+    errors = 0
+    
+    for i, idx in enumerate(indices):
+        prompt = prompt_template.format(
+            src=src[idx],
+            ref=ref[idx],
+            hyp=hyp[idx]
+        )
+        
+        try:
+            response = model.generate_content(prompt)
+            text = response.text.strip()
+            # Parse JSON from response
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            result = json.loads(text)
+            scores.append(result.get("score", 3))
+        except Exception as e:
+            errors += 1
+            scores.append(3)  # Default to middle score on error
+        
+        # Progress
+        if (i + 1) % 20 == 0:
+            print(f"  Gemini eval: {i+1}/{len(indices)}")
+    
+    avg_score = sum(scores) / len(scores) if scores else 0
+    
+    return {
+        "score": round(avg_score, 2),
+        "samples_evaluated": len(indices),
+        "errors": errors,
+        "score_distribution": {
+            str(i): scores.count(i) for i in range(1, 6)
+        }
+    }
+
+
+def compute_metrics(hyp: list, ref: list, src: list = None, use_meteor: bool = True) -> dict:
     """
     Compute translation metrics.
     
@@ -28,6 +161,7 @@ def compute_metrics(hyp: list, ref: list, src: list = None) -> dict:
         hyp: List of hypothesis translations
         ref: List of reference translations
         src: List of source sentences (optional, for COMET)
+        use_meteor: Whether to compute METEOR score
     
     Returns:
         Dictionary of metric scores
@@ -62,6 +196,16 @@ def compute_metrics(hyp: list, ref: list, src: list = None) -> dict:
     results["ter"] = {
         "score": round(ter_result.score, 2),
     }
+    
+    # METEOR
+    if use_meteor:
+        if METEOR_AVAILABLE:
+            meteor = compute_meteor(hyp, ref)
+            results["meteor"] = {
+                "score": round(meteor * 100, 2),  # Scale to 0-100 like other metrics
+            }
+        else:
+            print("  METEOR not available (install nltk: pip install nltk)")
     
     return results
 
@@ -113,6 +257,19 @@ def main():
                    help="Show N worst translations (0 to disable)")
     p.add_argument("--save_sentence_scores", default=None,
                    help="Save per-sentence scores to file")
+    p.add_argument("--no_meteor", action="store_true",
+                   help="Skip METEOR computation (faster)")
+    
+    # Gemini evaluation
+    p.add_argument("--gemini", action="store_true",
+                   help="Use Gemini as judge for evaluation")
+    p.add_argument("--gemini_api_key", default=None,
+                   help="Gemini API key (or set GEMINI_API_KEY env var)")
+    p.add_argument("--gemini_samples", type=int, default=100,
+                   help="Number of samples for Gemini evaluation")
+    p.add_argument("--direction", default="en2vi", choices=["en2vi", "vi2en"],
+                   help="Translation direction for Gemini prompt")
+    
     args = p.parse_args()
 
     # Load files
@@ -141,7 +298,28 @@ def main():
     print(f"\nEvaluating {len(hyp)} sentence pairs...")
 
     # Compute metrics
-    results = compute_metrics(hyp, ref, src)
+    results = compute_metrics(hyp, ref, src, use_meteor=not args.no_meteor)
+
+    # Gemini evaluation
+    if args.gemini:
+        if not src:
+            print("ERROR: --src is required for Gemini evaluation")
+        else:
+            api_key = args.gemini_api_key or os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                print("ERROR: Gemini API key required (--gemini_api_key or GEMINI_API_KEY env)")
+            elif not GEMINI_AVAILABLE:
+                print("ERROR: google-generativeai not installed (pip install google-generativeai)")
+            else:
+                print(f"\nRunning Gemini evaluation ({args.gemini_samples} samples)...")
+                gemini_result = compute_gemini_score(
+                    hyp, ref, src,
+                    api_key=api_key,
+                    sample_size=args.gemini_samples,
+                    direction=args.direction
+                )
+                if gemini_result:
+                    results["gemini"] = gemini_result
 
     # Print results
     print("\n" + "="*50)
@@ -151,6 +329,10 @@ def main():
     print(f"  chrF++:  {results['chrf++']['score']:.2f}")
     print(f"  chrF:    {results['chrf']['score']:.2f}")
     print(f"  TER:     {results['ter']['score']:.2f} (lower is better)")
+    if "meteor" in results:
+        print(f"  METEOR:  {results['meteor']['score']:.2f}")
+    if "gemini" in results:
+        print(f"  Gemini:  {results['gemini']['score']:.2f}/5.0 ({results['gemini']['samples_evaluated']} samples)")
     print("="*50)
 
     # Show worst translations
