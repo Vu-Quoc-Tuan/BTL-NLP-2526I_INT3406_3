@@ -166,6 +166,14 @@ class NEFTuneTrainer(Trainer):
             if self._neftune_hook_handle:
                 self._neftune_hook_handle.remove()
                 self._neftune_hook_handle = None
+    
+    def evaluate(self, *args, **kwargs):
+        """Override evaluate to clear CUDA cache after validation to prevent OOM."""
+        result = super().evaluate(*args, **kwargs)
+        # Clear CUDA cache after validation to free memory before resuming training
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return result
 
 
 def main():

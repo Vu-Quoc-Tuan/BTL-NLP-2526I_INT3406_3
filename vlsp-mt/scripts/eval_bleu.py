@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import random
+import time
 import sacrebleu
 from sacrebleu.metrics import BLEU, CHRF, TER
 
@@ -75,10 +76,16 @@ def compute_gemini_score(
     src: list,
     api_key: str,
     sample_size: int = 100,
-    direction: str = "en2vi"
+    direction: str = "en2vi",
+    verbose: bool = False,
+    batch_size: int = 10
 ) -> dict:
     """
     Use Gemini as judge to evaluate translation quality.
+    
+    Uses BATCHING to reduce API calls:
+    - Instead of 1 request per sentence, sends batch_size sentences per request
+    - 100 samples with batch_size=10 = only 10 API calls (vs 100 without batching)
     
     Returns average score (1-5) and detailed breakdown.
     """
@@ -97,59 +104,153 @@ def compute_gemini_score(
     src_lang = "English" if direction == "en2vi" else "Vietnamese"
     tgt_lang = "Vietnamese" if direction == "en2vi" else "English"
     
-    prompt_template = f"""You are an expert translator evaluating {src_lang} to {tgt_lang} medical translation quality.
-
-Rate the translation on a scale of 1-5:
-1 = Very poor (major errors, incomprehensible)
-2 = Poor (significant errors affecting meaning)
-3 = Acceptable (minor errors, meaning preserved)
-4 = Good (fluent, accurate, minor issues)
-5 = Excellent (perfect or near-perfect)
-
-Source ({src_lang}): {{src}}
-Reference ({tgt_lang}): {{ref}}
-Translation ({tgt_lang}): {{hyp}}
-
-Respond with ONLY a JSON object:
-{{"score": <1-5>, "reason": "<brief explanation>"}}"""
-
     scores = []
+    detailed_results = []
     errors = 0
     
-    for i, idx in enumerate(indices):
-        prompt = prompt_template.format(
-            src=src[idx],
-            ref=ref[idx],
-            hyp=hyp[idx]
-        )
+    # Split indices into batches
+    batches = [indices[i:i + batch_size] for i in range(0, len(indices), batch_size)]
+    total_batches = len(batches)
+    
+    print(f"  Using batching: {len(indices)} samples / {batch_size} per batch = {total_batches} API calls")
+    
+    for batch_num, batch_indices in enumerate(batches):
+        # Build batch prompt
+        samples_text = ""
+        for i, idx in enumerate(batch_indices):
+            samples_text += f"""
+--- Sample {i+1} ---
+Source ({src_lang}): {src[idx]}
+Reference ({tgt_lang}): {ref[idx]}
+Translation ({tgt_lang}): {hyp[idx]}
+"""
+        
+        prompt = f"""STRICT {src_lang}->{tgt_lang} medical translation evaluator.
+
+Score 1-2: Hallucination (added info), Omission (missing info), Wrong medical terms, Truncated
+Score 3: Minor errors, awkward phrasing
+Score 4: Accurate, minor style issues
+Score 5: Perfect, no errors
+
+Compare Translation to Source ONLY. Penalize hallucinations and omissions strictly.
+
+{samples_text}
+
+JSON array with {len(batch_indices)} objects: [{{"score": 1-5, "reason": "brief"}}, ...]"""
         
         try:
-            response = model.generate_content(prompt)
+            # Retry with exponential backoff for rate limits
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    response = model.generate_content(prompt)
+                    break
+                except Exception as retry_e:
+                    if "429" in str(retry_e):
+                        if attempt < max_retries - 1:
+                            wait_time = (attempt + 1) * 30  # 30s, 60s, 90s, 120s
+                            print(f"\n  Rate limited, waiting {wait_time}s... (attempt {attempt+1}/{max_retries})")
+                            time.sleep(wait_time)
+                        else:
+                            print(f"\n  Rate limit exceeded after {max_retries} retries. Waiting 120s before continuing...")
+                            time.sleep(120)
+                            raise retry_e
+                    else:
+                        raise retry_e
+            
             text = response.text.strip()
-            # Parse JSON from response
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            result = json.loads(text)
-            scores.append(result.get("score", 3))
+            # Parse JSON from response - handle various formats
+            if "```" in text:
+                parts = text.split("```")
+                if len(parts) >= 2:
+                    text = parts[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                    text = text.strip()
+            
+            # Try to find JSON array in text
+            import re
+            if not text.startswith("["):
+                json_match = re.search(r'\[[\s\S]*\]', text)
+                if json_match:
+                    text = json_match.group()
+            
+            batch_results = json.loads(text)
+            
+            # Process each result in batch
+            for i, idx in enumerate(batch_indices):
+                if i < len(batch_results):
+                    result = batch_results[i]
+                    score = result.get("score", 3)
+                    reason = result.get("reason", "")
+                    
+                    # Validate score is in range
+                    if not isinstance(score, (int, float)) or score < 1 or score > 5:
+                        score = 3
+                    score = int(score)
+                else:
+                    score = 3
+                    reason = "Missing from batch response"
+                    errors += 1
+                
+                scores.append(score)
+                detailed_results.append({
+                    "idx": idx,
+                    "score": score,
+                    "reason": reason,
+                    "src": src[idx][:100] + "..." if len(src[idx]) > 100 else src[idx],
+                    "hyp": hyp[idx][:100] + "..." if len(hyp[idx]) > 100 else hyp[idx],
+                    "ref": ref[idx][:100] + "..." if len(ref[idx]) > 100 else ref[idx],
+                })
+            
         except Exception as e:
-            errors += 1
-            scores.append(3)  # Default to middle score on error
+            # On batch error, assign default scores to all items in batch
+            for idx in batch_indices:
+                errors += 1
+                scores.append(3)
+                detailed_results.append({
+                    "idx": idx,
+                    "score": 3,
+                    "reason": f"BATCH ERROR: {str(e)}",
+                    "src": src[idx][:100],
+                    "hyp": hyp[idx][:100],
+                    "ref": ref[idx][:100],
+                })
+            if verbose:
+                print(f"\n  DEBUG: Batch {batch_num+1} error: {str(e)}")
         
         # Progress
-        if (i + 1) % 20 == 0:
-            print(f"  Gemini eval: {i+1}/{len(indices)}")
+        processed = min((batch_num + 1) * batch_size, len(indices))
+        print(f"  Gemini eval: {processed}/{len(indices)} (batch {batch_num+1}/{total_batches})")
+        
+        # Rate limit: wait between batches (4s per batch is safe for free tier)
+        if batch_num < total_batches - 1:
+            time.sleep(4)
     
     avg_score = sum(scores) / len(scores) if scores else 0
+    
+    # Print low scores for debugging
+    if verbose:
+        low_scores = [r for r in detailed_results if r["score"] <= 2]
+        if low_scores:
+            print(f"\n  === LOW SCORE SAMPLES (score <= 2): {len(low_scores)} ===")
+            for r in low_scores[:5]:
+                print(f"\n  [Line {r['idx']+1}] Score: {r['score']}")
+                print(f"    Reason: {r['reason']}")
+                print(f"    SRC: {r['src']}")
+                print(f"    HYP: {r['hyp']}")
+                print(f"    REF: {r['ref']}")
     
     return {
         "score": round(avg_score, 2),
         "samples_evaluated": len(indices),
         "errors": errors,
+        "api_calls": total_batches,
+        "batch_size": batch_size,
         "score_distribution": {
             str(i): scores.count(i) for i in range(1, 6)
-        }
+        },
+        "detailed_results": detailed_results if verbose else None
     }
 
 
@@ -267,8 +368,12 @@ def main():
                    help="Gemini API key (or set GEMINI_API_KEY env var)")
     p.add_argument("--gemini_samples", type=int, default=100,
                    help="Number of samples for Gemini evaluation")
+    p.add_argument("--gemini_batch_size", type=int, default=10,
+                   help="Number of samples per API call (batching to reduce rate limits)")
     p.add_argument("--direction", default="en2vi", choices=["en2vi", "vi2en"],
                    help="Translation direction for Gemini prompt")
+    p.add_argument("--gemini_verbose", action="store_true",
+                   help="Show detailed Gemini evaluation (low score samples)")
     
     args = p.parse_args()
 
@@ -311,12 +416,14 @@ def main():
             elif not GEMINI_AVAILABLE:
                 print("ERROR: google-generativeai not installed (pip install google-generativeai)")
             else:
-                print(f"\nRunning Gemini evaluation ({args.gemini_samples} samples)...")
+                print(f"\nRunning Gemini evaluation ({args.gemini_samples} samples, batch_size={args.gemini_batch_size})...")
                 gemini_result = compute_gemini_score(
                     hyp, ref, src,
                     api_key=api_key,
                     sample_size=args.gemini_samples,
-                    direction=args.direction
+                    direction=args.direction,
+                    verbose=args.gemini_verbose,
+                    batch_size=args.gemini_batch_size
                 )
                 if gemini_result:
                     results["gemini"] = gemini_result
@@ -333,6 +440,9 @@ def main():
         print(f"  METEOR:  {results['meteor']['score']:.2f}")
     if "gemini" in results:
         print(f"  Gemini:  {results['gemini']['score']:.2f}/5.0 ({results['gemini']['samples_evaluated']} samples)")
+        # Always show score distribution
+        dist = results['gemini']['score_distribution']
+        print(f"    Distribution: 1={dist.get('1',0)}, 2={dist.get('2',0)}, 3={dist.get('3',0)}, 4={dist.get('4',0)}, 5={dist.get('5',0)}")
     print("="*50)
 
     # Show worst translations
