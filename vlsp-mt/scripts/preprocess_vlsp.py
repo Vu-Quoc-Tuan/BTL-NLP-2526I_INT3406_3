@@ -178,6 +178,17 @@ def print_stats(name: str, pairs: List[Tuple[str, str]]):
     print(f"  Tgt length: min={min(tgt_lens)}, max={max(tgt_lens)}, avg={sum(tgt_lens)/len(tgt_lens):.1f}")
 
 
+    args = p.parse_args()
+
+    print("="*60)
+    print("VLSP Medical Translation Preprocessing")
+    print("="*60)
+
+    # Load data
+    print(f"\nLoading data from:")
+    print(f"  Source: {args.src_in}")
+    print(f"  Target: {args.tgt_in}")
+    
 def main():
     p = argparse.ArgumentParser(description="Preprocess VLSP Medical Translation data")
     
@@ -207,17 +218,6 @@ def main():
     
     # Other
     p.add_argument("--no_split", action="store_true", help="Don't split, just clean")
-    
-    args = p.parse_args()
-
-    print("="*60)
-    print("VLSP Medical Translation Preprocessing")
-    print("="*60)
-
-    # Load data
-    print(f"\nLoading data from:")
-    print(f"  Source: {args.src_in}")
-    print(f"  Target: {args.tgt_in}")
     
     pairs = load_parallel_corpus(args.src_in, args.tgt_in)
     print(f"Loaded {len(pairs):,} pairs")

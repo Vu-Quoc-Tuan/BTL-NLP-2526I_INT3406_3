@@ -377,13 +377,13 @@ def main():
         greater_is_better=False,
         
         # Performance optimizations for A100
-        dataloader_num_workers=4,
+        dataloader_num_workers=12,  # Increase if you have many CPU cores
         dataloader_pin_memory=True,
-        dataloader_prefetch_factor=2,
+        dataloader_prefetch_factor=4,
         gradient_checkpointing=not args.no_grad_checkpoint,
         gradient_checkpointing_kwargs={"use_reentrant": False} if not args.no_grad_checkpoint else None,
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
-        torch_compile=False,  # Set True if PyTorch 2.0+ for extra speed
+        torch_compile=True,  # PyTorch 2.0 compiler for extra speed
         
         # Other
         remove_unused_columns=False,

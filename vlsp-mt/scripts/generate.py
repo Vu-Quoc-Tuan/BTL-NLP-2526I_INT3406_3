@@ -4,6 +4,7 @@ Generate translations using trained LoRA model.
 Supports batching for faster inference.
 """
 import argparse
+import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
@@ -91,8 +92,8 @@ def generate_batch(
         max_length=512
     ).to(device)
     
-    # Generate
-    with torch.no_grad():
+    # Generate with optimizations
+    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
         if do_sample:
             outputs = model.generate(
                 **inputs,
@@ -102,6 +103,7 @@ def generate_batch(
                 top_p=top_p,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
+                use_cache=True,
             )
         else:
             outputs = model.generate(
@@ -111,6 +113,7 @@ def generate_batch(
                 num_beams=num_beams,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
+                use_cache=True,
             )
     
     # Decode
@@ -155,6 +158,7 @@ def main():
     print(f"Loading adapter: {args.adapter_path}")
     
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
+    tokenizer.padding_side = "left"  # Important for batch generation
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -234,6 +238,7 @@ def main():
     # ============================================================
     # Save output
     # ============================================================
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf8") as f:
         for hyp in all_translations:
             f.write(hyp + "\n")
