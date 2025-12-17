@@ -1,12 +1,3 @@
-# scripts/eval_bleu.py
-"""
-Evaluate machine translation quality using multiple metrics:
-- BLEU (SacreBLEU)
-- chrF / chrF++
-- TER (Translation Edit Rate)
-- METEOR
-- Gemini Score (LLM-as-judge, optional)
-"""
 import argparse
 import json
 import os
@@ -15,7 +6,7 @@ import time
 import sacrebleu
 from sacrebleu.metrics import BLEU, CHRF, TER
 
-# METEOR requires nltk
+# METEOR
 try:
     import nltk
     from nltk.translate.meteor_score import meteor_score
@@ -24,7 +15,7 @@ try:
 except ImportError:
     METEOR_AVAILABLE = False
 
-# Gemini requires google-generativeai
+# Gemini score
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
@@ -43,8 +34,7 @@ def compute_meteor(hyp: list, ref: list) -> float:
     """Compute corpus-level METEOR score."""
     if not METEOR_AVAILABLE:
         return None
-    
-    # Ensure NLTK data is available
+    nltk.download('punkt_tab')
     try:
         nltk.data.find('tokenizers/punkt')
     except LookupError:
@@ -82,18 +72,12 @@ def compute_gemini_score(
 ) -> dict:
     """
     Use Gemini as judge to evaluate translation quality.
-    
-    Uses BATCHING to reduce API calls:
-    - Instead of 1 request per sentence, sends batch_size sentences per request
-    - 100 samples with batch_size=10 = only 10 API calls (vs 100 without batching)
-    
-    Returns average score (1-5) and detailed breakdown.
     """
     if not GEMINI_AVAILABLE:
         return None
     
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-2.5-flash')
     
     # Sample if dataset is large
     indices = list(range(len(hyp)))
@@ -223,13 +207,12 @@ JSON array with {len(batch_indices)} objects: [{{"score": 1-5, "reason": "brief"
         processed = min((batch_num + 1) * batch_size, len(indices))
         print(f"  Gemini eval: {processed}/{len(indices)} (batch {batch_num+1}/{total_batches})")
         
-        # Rate limit: wait between batches (4s per batch is safe for free tier)
         if batch_num < total_batches - 1:
             time.sleep(4)
     
     avg_score = sum(scores) / len(scores) if scores else 0
     
-    # Print low scores for debugging
+    # Print debugging
     if verbose:
         low_scores = [r for r in detailed_results if r["score"] <= 2]
         if low_scores:

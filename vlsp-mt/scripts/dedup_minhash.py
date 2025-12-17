@@ -1,8 +1,3 @@
-# scripts/dedup_minhash.py
-"""
-Fuzzy deduplication using MinHash LSH.
-Removes near-duplicate sentence pairs based on character n-gram similarity.
-"""
 import argparse
 import os
 import json
@@ -55,11 +50,6 @@ def select_representative(
 ) -> int:
     """
     Select representative from a cluster.
-    
-    Strategies:
-    - shortest: shortest source (original behavior)
-    - longest: longest source (usually more complete)
-    - median: median length
     """
     if strategy == "shortest":
         return min(indices, key=lambda i: len(pairs[i][0]))
@@ -91,18 +81,6 @@ def deduplicate_minhash(
 ) -> Tuple[List[int], dict]:
     """
     Deduplicate pairs using MinHash LSH.
-    
-    Args:
-        pairs: List of (src, tgt) tuples
-        threshold: Jaccard similarity threshold for considering duplicates
-        num_perm: Number of permutations for MinHash
-        k: Shingle size
-        dedup_by: "src", "tgt", or "both"
-        rep_strategy: How to select representative from cluster
-        num_workers: Number of parallel workers for MinHash computation
-    
-    Returns:
-        List of indices to keep, and statistics dict
     """
     import multiprocessing
     

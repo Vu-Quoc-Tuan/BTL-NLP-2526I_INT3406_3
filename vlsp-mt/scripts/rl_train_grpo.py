@@ -1,8 +1,3 @@
-# scripts/rl_train_grpo.py
-"""
-GRPO (Group Relative Policy Optimization) for Machine Translation
-Optimized with batch generation and shared base model.
-"""
 import argparse
 import os
 import torch

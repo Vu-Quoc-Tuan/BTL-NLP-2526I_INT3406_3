@@ -1,8 +1,3 @@
-# scripts/analyze_vocab.py
-"""
-Analyze vocabulary overlap between train and test sets.
-Find OOV (out-of-vocabulary) words in test that don't appear in train.
-"""
 import argparse
 import re
 from collections import Counter
@@ -60,28 +55,23 @@ def main():
     print(f"  OOV word types: {oov_count:,} ({100*oov_count/len(test_vocab):.1f}% of test vocab)")
     print(f"  OOV tokens: {oov_tokens:,} ({100*oov_tokens/test_tokens:.1f}% of test tokens)")
     
-    # Top OOV words by frequency
     sorted_oov = sorted(oov_words.items(), key=lambda x: -x[1])
     
     print(f"\n  Top {args.top_oov} OOV words (by frequency in test):")
     for i, (word, count) in enumerate(sorted_oov[:args.top_oov], 1):
         print(f"    {i:3}. {word:30} (count: {count})")
 
-    # Save OOV to file
     if args.save_oov:
         with open(args.save_oov, 'w', encoding='utf8') as f:
             for word, count in sorted_oov:
                 f.write(f"{word}\t{count}\n")
         print(f"\nOOV words saved to: {args.save_oov}")
 
-    # Coverage analysis
     covered_tokens = test_tokens - oov_tokens
     print(f"\n{'='*50}")
     print("COVERAGE SUMMARY")
     print(f"{'='*50}")
     print(f"  Token coverage: {100*covered_tokens/test_tokens:.2f}%")
-    print(f"  (Higher is better - means more test words seen in training)")
-
 
 if __name__ == "__main__":
     main()

@@ -1,8 +1,3 @@
-# scripts/generate.py
-"""
-Generate translations using trained LoRA model.
-Supports batching for faster inference.
-"""
 import argparse
 import os
 import torch
@@ -81,7 +76,6 @@ def extract_translation(full_text: str, prompt: str) -> str:
     hyp = hyp.strip()
     
     # Remove any trailing incomplete sentences or artifacts
-    # Stop at common end markers if they appear mid-generation
     stop_markers = ["\n\nEnglish:", "\n\nVietnamese:", "\n\nYou are", "<|im_end|>", "<|endoftext|>"]
     for marker in stop_markers:
         if marker in hyp:

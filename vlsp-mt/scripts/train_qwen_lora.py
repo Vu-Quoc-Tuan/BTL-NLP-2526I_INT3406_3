@@ -1,8 +1,3 @@
-# scripts/train_qwen_lora.py
-"""
-SFT training with LoRA for Qwen model on medical translation task.
-Full performance version with NEFTune, label smoothing, early stopping, etc.
-"""
 import os
 import argparse
 import json
@@ -128,7 +123,6 @@ class NEFTuneTrainer(Trainer):
     """
     Trainer with NEFTune: adds noise to embeddings during training.
     Paper: https://arxiv.org/abs/2310.05914
-    Improves instruction tuning by ~2-3 BLEU.
     """
     def __init__(self, neftune_noise_alpha=5.0, **kwargs):
         super().__init__(**kwargs)
@@ -170,7 +164,6 @@ class NEFTuneTrainer(Trainer):
     def evaluate(self, *args, **kwargs):
         """Override evaluate to clear CUDA cache after validation to prevent OOM."""
         result = super().evaluate(*args, **kwargs)
-        # Clear CUDA cache after validation to free memory before resuming training
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return result

@@ -1,8 +1,3 @@
-# scripts/preprocess_vlsp.py
-"""
-Preprocessing script for VLSP Medical Translation dataset.
-Handles cleaning, filtering, deduplication, and train/dev/test splitting.
-"""
 import argparse
 import os
 import re
