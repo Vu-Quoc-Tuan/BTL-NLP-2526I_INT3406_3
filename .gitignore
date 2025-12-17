@@ -1,0 +1,5 @@
+# Ignore upload.py
+upload.py
+
+# Ignore runs directory
+runs/

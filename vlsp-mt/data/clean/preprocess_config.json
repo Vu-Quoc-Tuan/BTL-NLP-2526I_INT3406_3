@@ -1,0 +1,18 @@
+{
+  "src_in": "data/raw/train.en.txt",
+  "tgt_in": "data/raw/train.vi.txt",
+  "src_lang": "en",
+  "tgt_lang": "vi",
+  "out_dir": "data/clean",
+  "min_len": 3,
+  "max_len": 256,
+  "max_ratio": 3.0,
+  "min_alpha": 0.5,
+  "dedup": "both",
+  "dev_size": 1000,
+  "test_size": 1000,
+  "seed": 42,
+  "no_split": false,
+  "original_count": 500000,
+  "final_count": 339489
+}
