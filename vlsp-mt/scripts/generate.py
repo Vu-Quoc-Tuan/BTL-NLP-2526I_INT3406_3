@@ -4,87 +4,203 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 from tqdm import tqdm
+import re
+import unicodedata
 
 
 def build_prompt_en2vi(src):
+    """ChatML format for Qwen2.5 - English to Vietnamese translation."""
     return (
-        "You are a professional medical translator.\n"
-        "Translate the following English medical sentence into Vietnamese.\n\n"
-        f"English: {src}\nVietnamese:"
+        "<|im_start|>system\n"
+        "You are a professional medical translator. Translate the following English medical sentence into Vietnamese.<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"{src}<|im_end|>\n"
+        "<|im_start|>assistant\n"
     )
 
 
 def build_prompt_vi2en(src):
+    """ChatML format for Qwen2.5 - Vietnamese to English translation."""
     return (
-        "You are a professional medical translator.\n"
-        "Translate the following Vietnamese medical sentence into English.\n\n"
-        f"Vietnamese: {src}\nEnglish:"
+        "<|im_start|>system\n"
+        "You are a professional medical translator. Translate the following Vietnamese medical sentence into English.<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"{src}<|im_end|>\n"
+        "<|im_start|>assistant\n"
     )
 
 
-def postprocess_vi(text: str) -> str:
-    """Post-process Vietnamese translation."""
-    import re
-    # Chuẩn hóa dấu câu (xóa space trước dấu câu)
+# Ký tự Private Use Area để làm placeholder an toàn cho dấu ba chấm
+ELL_PLACEHOLDER = "\uE000"
+
+def _common_clean(text: str) -> str:
+    if not text: return ""
+    
+    # 1. Normalize NFC & Fancy Quotes (QUAN TRỌNG: Làm trước tiên)
+    text = unicodedata.normalize("NFC", text)
+    text = text.replace("’", "'") # Fix (D): Chuẩn hóa apostrophe trước
+    
+    # 2. Bảo vệ dấu ba chấm (...)
+    text = text.replace("...", ELL_PLACEHOLDER) # Fix (B)
+    
+    # 3. Xử lý dấu câu lặp (Fix A: Chỉ gom dấu giống nhau)
+    # !!! -> !, ??? -> ?, nhưng ?! -> ?!
+    # \1+ nghĩa là lặp lại group 1 ít nhất 1 lần nữa
+    text = re.sub(r'([.,!?;:])\1+', r'\1', text)
+    
+    # Trả lại dấu ba chấm
+    text = text.replace(ELL_PLACEHOLDER, "...")
+
+    # 4. Chuẩn hóa khoảng trắng trước dấu câu ( "hello !" -> "hello!")
     text = re.sub(r'\s+([.,!?;:])', r'\1', text)
-    # Chuẩn hóa quotes
-    text = re.sub(r'"\s+', '"', text)
-    text = re.sub(r'\s+"', '"', text)
-    # Xóa space thừa
+    
+    # 5. Smart Quote Handling (Giữ nguyên logic cũ vì ổn)
+    # Chỉ xóa khoảng trắng BÊN TRONG ngoặc: " hello " -> "hello"
+    text = re.sub(r'"\s+([^"]+?)\s+"', r'"\1"', text)
+
+    # 6. Dọn dẹp khoảng trắng thừa
     text = re.sub(r'\s+', ' ', text).strip()
-    # Capitalize đầu câu
+    
+    return text
+
+def _dedup_leading_repetition(text: str, max_phrase_words: int = 10) -> str:
+    """Loại bỏ lặp từ đầu câu (Stuttering error của LLM)"""
+    words = text.split()
+    if len(words) < 6:
+        return text
+    
+    # Check các cụm từ độ dài từ 3 đến max_phrase_words
+    for phrase_len in range(3, min(max_phrase_words, len(words)//3) + 1):
+        phrase = words[:phrase_len]
+        # Nếu phrase lặp lại ngay sau nó
+        if words[phrase_len:2*phrase_len] == phrase:
+            k = 2
+            # Tìm xem lặp bao nhiêu lần tiếp theo
+            while k*phrase_len < len(words) and words[k*phrase_len:(k+1)*phrase_len] == phrase:
+                k += 1
+            words = phrase + words[k*phrase_len:]
+            return " ".join(words)
+    return text
+
+def postprocess_vi(text: str) -> str:
+    text = _common_clean(text)
+    text = _dedup_leading_repetition(text)
     if text:
         text = text[0].upper() + text[1:]
     return text
-
 
 def postprocess_en(text: str) -> str:
-    """Post-process English translation."""
-    import re
-    # Chuẩn hóa dấu câu
-    text = re.sub(r'\s+([.,!?;:])', r'\1', text)
-    # Chuẩn hóa quotes
-    text = re.sub(r'"\s+', '"', text)
-    text = re.sub(r'\s+"', '"', text)
-    # Xóa space thừa
-    text = re.sub(r'\s+', ' ', text).strip()
-    # Capitalize đầu câu
+    text = _common_clean(text)
+    text = _dedup_leading_repetition(text)
+
+    # 1. Fix Apostrophe Spacing (Fix D: Đã chuẩn hóa ’ thành ' ở _common_clean rồi)
+    # Xử lý: "do ' nt", "teacher ' s" -> "do'nt", "teacher's"
+    text = re.sub(r"(\w)\s*'\s*(\w)", r"\1'\2", text)
+
+    # 2. Fix Tokenizer Split Errors (Fix E: Quan trọng cho LLM)
+    # Tokenizer hay tách: "do", "n't" -> model sinh ra "do n't"
+    # Cần flags=re.I để bắt cả "Do n't"
+    text = re.sub(r"\bdo\s+n't\b", "don't", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bca\s+n't\b", "can't", text, flags=re.IGNORECASE) # can not -> can't
+    text = re.sub(r"\bwo\s+n't\b", "won't", text, flags=re.IGNORECASE) # will not -> won't
+    text = re.sub(r"\bdoes\s+n't\b", "doesn't", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bdid\s+n't\b", "didn't", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bshould\s+n't\b", "shouldn't", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bcould\s+n't\b", "couldn't", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bwould\s+n't\b", "wouldn't", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bhave\s+n't\b", "haven't", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bhas\s+n't\b", "hasn't", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bhad\s+n't\b", "hadn't", text, flags=re.IGNORECASE)
+
+    # 3. Fix các contraction thông thường (nếu bị tách kiểu Dont -> Don't)
+    text = re.sub(r"\b([Dd])ont\b", r"\1on't", text)
+    text = re.sub(r"\b([Cc])ant\b", r"\1an't", text)
+    text = re.sub(r"\b([Ww])ont\b", r"\1on't", text)
+    
+    # 4. Fix "i" -> "I" (đứng riêng lẻ)
+    text = re.sub(r"\bi\b", "I", text)
+    # Fix "i'm" -> "I'm" (an toàn hơn, tránh động vào IM y khoa)
+    text = re.sub(r"\bi'm\b", "I'm", text)
+
+    # Viết hoa chữ cái đầu
     if text:
         text = text[0].upper() + text[1:]
-    # Chuẩn hóa I'm, don't, etc.
-    text = re.sub(r"\bi\b", "I", text)
     return text
 
 
-def extract_translation(full_text: str, prompt: str) -> str:
-    """Extract translation from generated text, handling various edge cases."""
-    # Method 1: Find the prompt and take everything after
-    if prompt in full_text:
-        hyp = full_text.split(prompt, 1)[1]
-    else:
-        # Method 2: Look for the language marker
-        markers = ["Vietnamese:", "English:"]
-        hyp = full_text
-        for marker in markers:
-            if marker in full_text:
-                parts = full_text.rsplit(marker, 1)
-                if len(parts) > 1:
-                    hyp = parts[1]
-                    break
-    
-    # Clean up
-    hyp = hyp.strip()
-    
-    # Remove any trailing incomplete sentences or artifacts
-    stop_markers = ["\n\nEnglish:", "\n\nVietnamese:", "\n\nYou are", "<|im_end|>", "<|endoftext|>"]
+
+ASSISTANT_PATTERN = re.compile(
+    r"<\|im_start\|>assistant\s*(.*?)(?:<\|im_end\|>|$)",
+    re.DOTALL | re.IGNORECASE
+)
+
+CLEANUP_FILLER = re.compile(
+    r'^(?:Sure|Certainly|Of course|Okay|Ok|Yes|No problem)[!.,]?\s*',
+    re.IGNORECASE
+)
+
+CLEANUP_INTRO = re.compile(
+    r'^(?:Here is|Below is|This is|The)?\s*(?:the\s+)?'
+    r'(?:translation|meaning|answer|response|result|target|vietnamese|english)'
+    r'(?:\s+is)?\s*[:：\.\-–—]\s*',
+    re.IGNORECASE
+)
+
+STRICT_SEPARATOR_STR = (
+    r'(?:'
+    r'\s*\n+\s*'
+    r'|'
+    r'\s+(?:translation|dịch|meaning|answer|target|vietnamese|english)\s*[:：\.\-–—]\s*'
+    r'|'
+    r'\s*(?:[-=]+>|→)\s*'
+    r')'
+)
+
+def extract_translation(full_text: str, src_text: str = None, direction: str = "en2vi") -> str:
+    # 1) Lấy block assistant cuối (memory-friendly)
+    last = None
+    for m in ASSISTANT_PATTERN.finditer(full_text):
+        last = m
+    hyp = last.group(1).strip() if last else full_text.strip()
+
+    # 2) Source repetition (dynamic)
+    if src_text:
+        src_words = src_text.strip().split()
+        if src_words:
+            flexible_src_regex = r"\s+".join(re.escape(w) for w in src_words)
+            src_repetition_pattern = (
+                r'^(?:source|original|text|câu gốc|src)?\s*[:\-]?\s*'
+                + flexible_src_regex
+                + STRICT_SEPARATOR_STR
+            )
+            m2 = re.search(src_repetition_pattern, hyp, flags=re.IGNORECASE | re.DOTALL)
+            if m2:
+                hyp = hyp[m2.end():].strip()
+
+    # 3) Cleanup layered (lặp vài vòng để bắt "Sure! Here is the translation:")
+    for _ in range(3):
+        new = CLEANUP_FILLER.sub('', hyp)
+        new = CLEANUP_INTRO.sub('', new)
+        if new == hyp:
+            break
+        hyp = new
+
+    # 4) Stop markers (earliest cut)
+    stop_markers = ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]
+    if direction == "en2vi":
+        stop_markers += ["\nEnglish:", "English:"]
+    elif direction == "vi2en":
+        stop_markers += ["\nVietnamese:", "Vietnamese:"]
+
+    cut_pos = None
     for marker in stop_markers:
-        if marker in hyp:
-            hyp = hyp.split(marker)[0]
-    
-    # Replace newlines with spaces
-    hyp = hyp.replace("\n", " ").strip()
-    
-    return hyp
+        idx = hyp.find(marker)
+        if idx != -1:
+            cut_pos = idx if cut_pos is None else min(cut_pos, idx)
+    if cut_pos is not None:
+        hyp = hyp[:cut_pos]
+
+    return " ".join(hyp.split())
 
 
 def load_input_file(path: str, max_samples: int = None) -> list:
@@ -110,7 +226,8 @@ def generate_batch(
     num_beams: int,
     length_penalty: float,
     repetition_penalty: float,
-    device
+    device,
+    direction: str = "en2vi"
 ) -> list:
     """Generate translations for a batch of prompts."""
     # Tokenize with padding
@@ -154,7 +271,7 @@ def generate_batch(
     # Extract translations
     translations = []
     for full_text, prompt in zip(generated_texts, prompts):
-        hyp = extract_translation(full_text, prompt)
+        hyp = extract_translation(full_text, prompt, direction=direction)
         translations.append(hyp)
     
     return translations
@@ -191,7 +308,15 @@ def main():
     print(f"Loading model: {args.model_name}")
     print(f"Loading adapter: {args.adapter_path}")
     
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
+    # Load tokenizer from adapter path first (may have extended vocab from training)
+    # Fallback to base model if adapter doesn't have tokenizer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.adapter_path, use_fast=False)
+        print(f"Loaded tokenizer from adapter (may include medical vocab)")
+    except:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
+        print(f"Loaded tokenizer from base model")
+    
     tokenizer.padding_side = "left"  # Important for batch generation
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -260,7 +385,8 @@ def main():
                 num_beams=args.num_beams,
                 length_penalty=args.length_penalty,
                 repetition_penalty=args.repetition_penalty,
-                device=device
+                device=device,
+                direction=args.direction
             )
         else:
             translations = []

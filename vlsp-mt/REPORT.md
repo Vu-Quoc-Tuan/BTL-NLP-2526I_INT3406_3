@@ -295,6 +295,10 @@ def build_minhash(text: str, num_perm: int = 128, k: int = 5) -> MinHash:
         m.update(shingle.encode('utf8'))
     return m
 ```
+MinHash không hiểu tiếng Việt, không hiểu nghĩa.
+Nó chỉ dựa vào: “hai câu giống nhau thì sẽ có nhiều mảnh giống nhau → nhiều hash trùng nhau”.
+Lặp đủ nhiều lần → ra con số gần đúng nhưng rất tin cậy.
+
 
 **Bước 3: LSH Indexing và Clustering**
 
@@ -310,6 +314,11 @@ for i in range(n):
     for c in candidates:
         union(i, int(c[1:]))
 ```
+
+Các câu
+→ chia thành mảnh nhỏ k ký tự (shingles)
+→ từ các mảnh đó tạo ra 1 dấu vân tay gồm 128 số (MinHash)
+→ LSH dùng dấu vân tay này để lọc nhanh những câu có khả năng giống nhau
 
 **Bước 4: Chọn Representative**
 

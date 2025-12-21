@@ -105,8 +105,35 @@ vlsp-mt/
 | 10k-100k | 32 | 4-8 | 4 | 3-5 | 2e-4 |
 | >100k | 64 | 8-16 | 4-8 | 2-3 | 1e-4 |
 
+## Data Augmentation (Optional)
+
+### Back-translation
+Dùng model vi2en để tạo thêm data cho en2vi (và ngược lại):
+
+```bash
+# 1. Train model vi2en trước
+python scripts/train_qwen_lora.py --direction vi2en ...
+
+# 2. Back-translate monolingual Vietnamese data
+python scripts/back_translate.py \
+    --model_name Qwen/Qwen2.5-3B-Instruct \
+    --adapter_path runs/qwen_vi2en_v1/lora_vi2en_sft \
+    --input data/monolingual/vi.txt \
+    --output data/augment/bt.en \
+    --direction vi2en \
+    --batch_size 16 --temperature 0.7
+
+# 3. Combine với original data
+cat data/clean/train.en data/augment/bt.en > data/augment/train_aug.en
+cat data/clean/train.vi data/monolingual/vi.txt > data/augment/train_aug.vi
+
+# 4. Train lại với augmented data
+python scripts/train_qwen_lora.py --direction en2vi \
+    --src data/augment/train_aug.en --tgt data/augment/train_aug.vi ...
+```
+
 ## Troubleshooting
 
 - **OOM**: Giảm `batch_size`, tăng `grad_accum`, dùng `--max_len 128`
 - **Loss không giảm**: Giảm lr, tăng `lora_r`
-- **BLEU thấp**: Train thêm epochs, dùng RL fine-tuning
+- **BLEU thấp**: Train thêm epochs, dùng RL fine-tuning, hoặc back-translation

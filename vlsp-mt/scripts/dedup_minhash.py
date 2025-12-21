@@ -14,6 +14,30 @@ def normalize_text(text: str) -> str:
     return text
 
 
+def get_smart_threshold(text: str) -> float:
+    """
+    Trả về threshold dedup dựa trên độ nhạy cảm của con số trong câu.
+    - Số liệu y khoa (mg, ml, mmHg...) -> threshold cao (0.95) để bảo vệ
+    - Câu thường hoặc số hành chính (tuổi, ngày...) -> threshold thấp (0.85) để lọc mạnh
+    """
+    text_lower = text.lower()
+    
+    # DANH SÁCH ĐƠN VỊ Y KHOA NHẠY CẢM (Cần bảo vệ tuyệt đối)
+    # Regex này bắt: Số + khoảng trắng (tùy chọn) + đơn vị
+    # Ví dụ bắt: "5mg", "5 mg", "120/80 mmHg", "38.5 độ", "95%"
+    sensitive_pattern = r'\d+\.?\d*\s*(mg|g|kg|ml|l|mmol|mol|iu|ui|mmhg|cmh2o|bpm|%|độ|degree|viên|tablets?|capsules?|liều|gói|ống|chai|lọ|mcg|µg|ng|pg|meq|units?)'
+    
+    if re.search(sensitive_pattern, text_lower):
+        # CASE 1: Có số liệu lâm sàng -> Bảo vệ kỹ
+        # Giữ lại nếu khác nhau dù chỉ một chút (vd: 5mg vs 50mg)
+        return 0.95
+    else:
+        # CASE 2: Không có số HOẶC chỉ có số hành chính (tuổi, ngày, năm...)
+        # Ví dụ: "Bệnh nhân 65 tuổi", "Điều trị 5 ngày"
+        # -> Lọc mạnh tay để model học văn phong đa dạng, tránh lặp template
+        return 0.85
+
+
 def char_shingles(text: str, k: int = 5) -> Set[str]:
     """Generate character k-shingles from text."""
     text = normalize_text(text)
@@ -24,6 +48,8 @@ def char_shingles(text: str, k: int = 5) -> Set[str]:
 
 def build_minhash(text: str, num_perm: int = 128, k: int = 5) -> MinHash:
     """Build MinHash signature for text."""
+    if not text.strip() or not text :
+        return MinHash(num_perm=num_perm)
     m = MinHash(num_perm=num_perm)
     for shingle in char_shingles(text, k=k):
         m.update(shingle.encode('utf8'))
@@ -77,10 +103,15 @@ def deduplicate_minhash(
     k: int = 5,
     dedup_by: str = "both",
     rep_strategy: str = "longest",
-    num_workers: int = 12
+    num_workers: int = 12,
+    use_smart_threshold: bool = True
 ) -> Tuple[List[int], dict]:
     """
-    Deduplicate pairs using MinHash LSH.
+    Deduplicate pairs using MinHash LSH with smart threshold.
+    
+    Smart threshold:
+    - 0.95 cho câu có số liệu y khoa (mg, ml, mmHg...) -> bảo vệ kỹ
+    - 0.85 cho câu thường -> lọc mạnh tay
     """
     import multiprocessing
     
@@ -97,8 +128,22 @@ def deduplicate_minhash(
         else:  # both
             texts.append(src + " ||| " + tgt)
     
+    # Compute smart thresholds for each text
+    if use_smart_threshold:
+        print("Computing smart thresholds based on medical content...")
+        thresholds = [get_smart_threshold(text) for text in texts]
+        high_thresh_count = sum(1 for t in thresholds if t >= 0.95)
+        low_thresh_count = n - high_thresh_count
+        print(f"  High threshold (0.95 - medical): {high_thresh_count:,} ({high_thresh_count/n:.1%})")
+        print(f"  Low threshold (0.85 - normal):   {low_thresh_count:,} ({low_thresh_count/n:.1%})")
+        # Use lower threshold for LSH index (to catch all potential duplicates)
+        lsh_threshold = 0.85
+    else:
+        thresholds = [threshold] * n
+        lsh_threshold = threshold
+    
     # Build MinHash signatures (parallel for large datasets)
-    print(f"Building MinHash signatures (threshold={threshold}, k={k})...")
+    print(f"Building MinHash signatures (LSH threshold={lsh_threshold}, k={k})...")
     minhashes = [None] * n
     
     if n > 10000 and num_workers > 1:
@@ -121,14 +166,14 @@ def deduplicate_minhash(
         for i, text in enumerate(tqdm(texts, desc="Computing MinHash")):
             minhashes[i] = build_minhash(text, num_perm=num_perm, k=k)
     
-    # Build LSH index
+    # Build LSH index with lower threshold to catch all candidates
     print("Building LSH index...")
-    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    lsh = MinHashLSH(threshold=lsh_threshold, num_perm=num_perm)
     for i, m in enumerate(tqdm(minhashes, desc="Indexing")):
         lsh.insert(f"m{i}", m)
     
-    # Find clusters using Union-Find for efficiency
-    print("Finding duplicate clusters...")
+    # Find clusters using Union-Find with smart threshold
+    print("Finding duplicate clusters (with smart threshold filtering)...")
     parent = list(range(n))
     
     def find(x):
@@ -141,12 +186,24 @@ def deduplicate_minhash(
         if px != py:
             parent[px] = py
     
-    # Query and union similar items
+    # Query and union similar items - apply smart threshold
+    skipped_by_smart = 0
     for i in tqdm(range(n), desc="Clustering"):
         candidates = lsh.query(minhashes[i])
         for c in candidates:
             j = int(c[1:])
-            union(i, j)
+            if i != j:
+                # Compute actual Jaccard similarity
+                similarity = minhashes[i].jaccard(minhashes[j])
+                # Use the higher threshold of the two (more protective)
+                effective_threshold = max(thresholds[i], thresholds[j])
+                if similarity >= effective_threshold:
+                    union(i, j)
+                else:
+                    skipped_by_smart += 1
+    
+    if use_smart_threshold:
+        print(f"  Pairs skipped by smart threshold: {skipped_by_smart:,}")
     
     # Group by root
     from collections import defaultdict
@@ -207,6 +264,10 @@ def main():
                    help="Deduplicate by source, target, or both")
     p.add_argument("--rep_strategy", choices=["shortest", "longest", "median"], 
                    default="longest", help="How to select representative from cluster")
+    p.add_argument("--smart_threshold", action="store_true", default=True,
+                   help="Use smart threshold: 0.95 for medical numbers (mg, ml...), 0.85 for normal text")
+    p.add_argument("--no_smart_threshold", dest="smart_threshold", action="store_false",
+                   help="Disable smart threshold, use fixed --threshold value")
     
     args = p.parse_args()
 
@@ -226,7 +287,8 @@ def main():
         num_perm=args.num_perm,
         k=args.k,
         dedup_by=args.dedup_by,
-        rep_strategy=args.rep_strategy
+        rep_strategy=args.rep_strategy,
+        use_smart_threshold=args.smart_threshold
     )
 
     # Print statistics
@@ -264,6 +326,7 @@ def main():
         **stats,
         "parameters": {
             "threshold": args.threshold,
+            "smart_threshold": args.smart_threshold,
             "k": args.k,
             "num_perm": args.num_perm,
             "dedup_by": args.dedup_by,

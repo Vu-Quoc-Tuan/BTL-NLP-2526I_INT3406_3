@@ -1,0 +1,9 @@
+# Medical Vocabulary - Thêm từ chuyên ngành y tế vào đây (mỗi dòng 1 từ)
+# Ví dụ:
+# hydroxychloroquine
+# acetaminophen
+# cardiovascular
+# gastroenteritis
+# hypertension
+# myocardial
+# glomerulonephritis

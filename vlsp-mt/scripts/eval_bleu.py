@@ -15,6 +15,25 @@ try:
 except ImportError:
     METEOR_AVAILABLE = False
 
+
+def ensure_nltk_resources():
+    """Download NLTK resources once if not available."""
+    if not METEOR_AVAILABLE:
+        return
+    
+    resources = {
+        "punkt": "tokenizers/punkt",
+        "punkt_tab": "tokenizers/punkt_tab",
+        "wordnet": "corpora/wordnet",
+        "omw-1.4": "corpora/omw-1.4",
+    }
+    for pkg, path in resources.items():
+        try:
+            nltk.data.find(path)
+        except LookupError:
+            print(f"Downloading NLTK resource: {pkg}")
+            nltk.download(pkg, quiet=True)
+
 # Gemini score
 try:
     import google.generativeai as genai
@@ -34,19 +53,9 @@ def compute_meteor(hyp: list, ref: list) -> float:
     """Compute corpus-level METEOR score."""
     if not METEOR_AVAILABLE:
         return None
-    nltk.download('punkt_tab')
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('punkt', quiet=True)
-    try:
-        nltk.data.find('corpora/wordnet')
-    except LookupError:
-        nltk.download('wordnet', quiet=True)
-    try:
-        nltk.data.find('corpora/omw-1.4')
-    except LookupError:
-        nltk.download('omw-1.4', quiet=True)
+    
+    # Download resources once (nếu chưa có)
+    ensure_nltk_resources()
     
     scores = []
     for h, r in zip(hyp, ref):
@@ -116,7 +125,7 @@ Score 3: Minor errors, awkward phrasing
 Score 4: Accurate, minor style issues
 Score 5: Perfect, no errors
 
-Compare Translation to Source ONLY. Penalize hallucinations and omissions strictly.
+Compare Translation to Source and use reference as support. Penalize hallucinations and omissions strictly.
 
 {samples_text}
 
