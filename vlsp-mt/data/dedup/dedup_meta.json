@@ -1,0 +1,26 @@
+{
+  "original_count": 337489,
+  "kept_count": 334812,
+  "removed_count": 2677,
+  "keep_ratio": 0.9920678896201062,
+  "num_clusters": 334812,
+  "avg_cluster_size": 1.0079955318208427,
+  "max_cluster_size": 11,
+  "singleton_clusters": 332343,
+  "parameters": {
+    "threshold": 0.8,
+    "smart_threshold": true,
+    "k": 5,
+    "num_perm": 128,
+    "dedup_by": "both",
+    "rep_strategy": "longest"
+  },
+  "input_files": {
+    "src": "data/clean/train.en",
+    "tgt": "data/clean/train.vi"
+  },
+  "output_files": {
+    "src": "data/dedup/train.en",
+    "tgt": "data/dedup/train.vi"
+  }
+}
