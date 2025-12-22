@@ -127,14 +127,11 @@ class NEFTuneTrainer(Trainer):
         if self._neftune_hook_handle is not None:
             return
         
-        # FIX: Dùng API chuẩn để lấy embedding layer, bền với mọi kiến trúc
         embed_layer = self.model.get_input_embeddings()
         neftune_alpha = self.neftune_noise_alpha
         
         def neftune_hook(module, input, output):
             if module.training:
-                # Output shape: [batch, seq_len, hidden]
-                # Dùng tensor để tránh lỗi device sync
                 dims = torch.tensor(
                     output.size(1) * output.size(2), 
                     device=output.device,
@@ -157,47 +154,26 @@ class NEFTuneTrainer(Trainer):
                 self._neftune_hook_handle = None
     
     def evaluate(self, *args, **kwargs):
-        """Override evaluate to clear CUDA cache after validation to prevent OOM."""
+        """Override evaluate to clear CUDA cache after validation."""
         result = super().evaluate(*args, **kwargs)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return result
 
 
-class BLEUEvalTrainer(Trainer):
-    """
-    Trainer with BLEU evaluation during training.
-    Generates translations and computes BLEU score.
-    """
-    def __init__(self, eval_src_texts=None, eval_tgt_texts=None, 
-                 direction="en2vi", bleu_metric=None, gen_max_len=128,
-                 bleu_sample_size=200, **kwargs):
-        super().__init__(**kwargs)
-        self.eval_src_texts = eval_src_texts or []
-        self.eval_tgt_texts = eval_tgt_texts or []
-        self.direction = direction
-        self.bleu_metric = bleu_metric
-        self.gen_max_len = gen_max_len
-        self.bleu_sample_size = bleu_sample_size  # Sample để tính BLEU (tiết kiệm thời gian)
+class BLEUEvalMixin:
+    """Mixin class for BLEU evaluation functionality."""
     
-    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        # Gọi evaluate gốc để lấy loss
-        output = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
-        
-        # Tính BLEU nếu có data
-        if self.eval_src_texts and self.eval_tgt_texts and self.bleu_metric:
-            bleu_score = self._compute_bleu()
-            output[f"{metric_key_prefix}_bleu"] = bleu_score
-            print(f"\n>>> BLEU Score: {bleu_score:.2f}")
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        return output
+    def _get_tokenizer(self):
+        """Get tokenizer compatible with different transformers versions."""
+        if hasattr(self, 'processing_class') and self.processing_class:
+            return self.processing_class
+        return self.tokenizer
     
     def _compute_bleu(self):
         """Generate translations and compute BLEU."""
         self.model.eval()
+        tokenizer = self._get_tokenizer()
         
         # Sample subset để tính BLEU (tránh quá lâu)
         n_samples = min(self.bleu_sample_size, len(self.eval_src_texts))
@@ -210,13 +186,13 @@ class BLEUEvalTrainer(Trainer):
         build_prompt = build_prompt_en2vi if self.direction == "en2vi" else build_prompt_vi2en
         
         # Generate từng batch nhỏ
-        batch_size = 8
+        batch_size = 4  # Smaller batch for stability
         for i in range(0, len(src_samples), batch_size):
             batch_src = src_samples[i:i+batch_size]
             batch_prompts = [build_prompt(s) for s in batch_src]
             
             # Tokenize
-            inputs = self.tokenizer(
+            inputs = tokenizer(
                 batch_prompts, 
                 return_tensors="pt", 
                 padding=True,
@@ -229,31 +205,87 @@ class BLEUEvalTrainer(Trainer):
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=self.gen_max_len,
-                    do_sample=False,  # Greedy for consistency
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
+                    do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
                 )
             
             # Decode - chỉ lấy phần generated (bỏ prompt)
             for j, output in enumerate(outputs):
                 prompt_len = inputs.input_ids[j].shape[0]
                 generated = output[prompt_len:]
-                text = self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+                text = tokenizer.decode(generated, skip_special_tokens=True).strip()
                 predictions.append(text)
         
         # Compute BLEU
-        references = [[ref] for ref in tgt_samples]  # BLEU expects list of references
+        references = [[ref] for ref in tgt_samples]
         result = self.bleu_metric.compute(predictions=predictions, references=references)
         
-        return result["bleu"] * 100  # Convert to percentage
+        return result["bleu"] * 100
 
 
-class NEFTuneBLEUTrainer(BLEUEvalTrainer):
-    """Combined NEFTune + BLEU evaluation trainer."""
-    def __init__(self, neftune_noise_alpha=5.0, **kwargs):
+class BLEUEvalTrainer(Trainer, BLEUEvalMixin):
+    """Trainer with BLEU evaluation during training."""
+    
+    def __init__(self, eval_src_texts=None, eval_tgt_texts=None, 
+                 direction="en2vi", bleu_metric=None, gen_max_len=128,
+                 bleu_sample_size=200, **kwargs):
         super().__init__(**kwargs)
+        self.eval_src_texts = list(eval_src_texts) if eval_src_texts else []
+        self.eval_tgt_texts = list(eval_tgt_texts) if eval_tgt_texts else []
+        self.direction = direction
+        self.bleu_metric = bleu_metric
+        self.gen_max_len = gen_max_len
+        self.bleu_sample_size = bleu_sample_size
+    
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        # Gọi evaluate gốc của Trainer để lấy loss
+        output = Trainer.evaluate(self, eval_dataset, ignore_keys, metric_key_prefix)
+        
+        # Debug info
+        print(f"\n[DEBUG] eval_src_texts len: {len(self.eval_src_texts)}")
+        print(f"[DEBUG] eval_tgt_texts len: {len(self.eval_tgt_texts)}")
+        print(f"[DEBUG] bleu_metric: {self.bleu_metric is not None}")
+        
+        # Tính BLEU - LUÔN thêm eval_bleu vào output
+        if self.eval_src_texts and self.eval_tgt_texts and self.bleu_metric:
+            try:
+                bleu_score = self._compute_bleu()
+                output[f"{metric_key_prefix}_bleu"] = bleu_score
+                print(f"\n>>> BLEU Score: {bleu_score:.2f}")
+            except Exception as e:
+                print(f"\n[WARNING] BLEU computation failed: {e}")
+                import traceback
+                traceback.print_exc()
+                output[f"{metric_key_prefix}_bleu"] = 0.0
+        else:
+            # Fallback: thêm eval_bleu = 0 để tránh KeyError
+            print(f"\n[WARNING] BLEU skipped - missing data")
+            output[f"{metric_key_prefix}_bleu"] = 0.0
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return output
+
+
+class NEFTuneBLEUTrainer(Trainer, BLEUEvalMixin):
+    """Combined NEFTune + BLEU evaluation trainer."""
+    
+    def __init__(self, neftune_noise_alpha=5.0, eval_src_texts=None, eval_tgt_texts=None,
+                 direction="en2vi", bleu_metric=None, gen_max_len=128,
+                 bleu_sample_size=200, **kwargs):
+        super().__init__(**kwargs)
+        # NEFTune params
         self.neftune_noise_alpha = neftune_noise_alpha
         self._neftune_hook_handle = None
+        # BLEU params
+        self.eval_src_texts = list(eval_src_texts) if eval_src_texts else []
+        self.eval_tgt_texts = list(eval_tgt_texts) if eval_tgt_texts else []
+        self.direction = direction
+        self.bleu_metric = bleu_metric
+        self.gen_max_len = gen_max_len
+        self.bleu_sample_size = bleu_sample_size
     
     def _setup_neftune_hook(self):
         if self._neftune_hook_handle is not None:
@@ -284,6 +316,36 @@ class NEFTuneBLEUTrainer(BLEUEvalTrainer):
             if self._neftune_hook_handle:
                 self._neftune_hook_handle.remove()
                 self._neftune_hook_handle = None
+    
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        # Gọi evaluate gốc của Trainer
+        output = Trainer.evaluate(self, eval_dataset, ignore_keys, metric_key_prefix)
+        
+        # Debug info
+        print(f"\n[DEBUG] eval_src_texts len: {len(self.eval_src_texts)}")
+        print(f"[DEBUG] eval_tgt_texts len: {len(self.eval_tgt_texts)}")
+        print(f"[DEBUG] bleu_metric: {self.bleu_metric is not None}")
+        
+        # Tính BLEU - LUÔN thêm eval_bleu vào output
+        if self.eval_src_texts and self.eval_tgt_texts and self.bleu_metric:
+            try:
+                bleu_score = self._compute_bleu()
+                output[f"{metric_key_prefix}_bleu"] = bleu_score
+                print(f"\n>>> BLEU Score: {bleu_score:.2f}")
+            except Exception as e:
+                print(f"\n[WARNING] BLEU computation failed: {e}")
+                import traceback
+                traceback.print_exc()
+                output[f"{metric_key_prefix}_bleu"] = 0.0
+        else:
+            # Fallback: thêm eval_bleu = 0 để tránh KeyError
+            print(f"\n[WARNING] BLEU skipped - missing data")
+            output[f"{metric_key_prefix}_bleu"] = 0.0
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return output
 
 
 def main():

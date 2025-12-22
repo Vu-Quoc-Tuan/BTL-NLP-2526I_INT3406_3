@@ -147,6 +147,8 @@ python scripts/train_qwen_lora.py \
 
 Sau khi co SFT model, dung RL de fine-tune them:
 
+### 4A. RL Training EN->VI
+
 ```bash
 python scripts/rl_train_grpo.py \
     --model_name Qwen/Qwen2.5-3B-Instruct \
@@ -156,6 +158,26 @@ python scripts/rl_train_grpo.py \
     --rl_tgt data/clean/train.vi \
     --run_id en2vi_v1_rl \
     --direction en2vi \
+    --epochs 1 \
+    --batch_size 4 \
+    --grad_accum_steps 8 \
+    --lr 3e-6 \
+    --kl_coef 0.02 \
+    --temperature 0.8 \
+    --max_new_tokens 64
+```
+
+### 4B. RL Training VI->EN
+
+```bash
+python scripts/rl_train_grpo.py \
+    --model_name Qwen/Qwen2.5-3B-Instruct \
+    --sft_adapter runs/vi2en_v1/lora_vi2en_sft \
+    --init_adapter runs/vi2en_v1/lora_vi2en_sft \
+    --rl_src data/clean/train.vi \
+    --rl_tgt data/clean/train.en \
+    --run_id vi2en_v1_rl \
+    --direction vi2en \
     --epochs 1 \
     --batch_size 4 \
     --grad_accum_steps 8 \

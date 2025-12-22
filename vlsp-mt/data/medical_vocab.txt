@@ -1,9 +1,60 @@
-# Medical Vocabulary - Thêm từ chuyên ngành y tế vào đây (mỗi dòng 1 từ)
-# Ví dụ:
-# hydroxychloroquine
-# acetaminophen
-# cardiovascular
-# gastroenteritis
-# hypertension
-# myocardial
-# glomerulonephritis
+# Medical Vocabulary - Từ chuyên ngành y tế
+# Thuốc / Dược phẩm
+acetaminophen
+ibuprofen
+hydroxychloroquine
+metformin
+rituximab
+dexamethasone
+omeprazole
+amoxicillin
+ciprofloxacin
+vancomycin
+
+# Bệnh lý
+meningitis
+endocarditis
+pneumonia
+hepatosplenomegaly
+glomerulonephritis
+cardiomyopathy
+encephalopathy
+neuropathy
+myocarditis
+pericarditis
+
+# Hội chứng
+syndrome
+MINOCA
+ARDS
+sepsis
+thrombosis
+embolism
+ischemia
+infarction
+hemorrhage
+aneurysm
+
+# Phẫu thuật / Thủ thuật
+thoracotomy
+laparoscopy
+angiography
+endoscopy
+biopsy
+resection
+anastomosis
+embolization
+catheterization
+intubation
+
+# Giải phẫu / Cơ quan
+myocardial
+cardiovascular
+gastrointestinal
+musculoskeletal
+cerebrospinal
+hepatobiliary
+genitourinary
+pulmonary
+renal
+pancreatic
