@@ -222,8 +222,8 @@ def main():
         attn_implementation=attn_impl,
     )
     
-    # Resize embeddings nếu tokenizer có thêm medical tokens
-    if len(tokenizer) > base_model.config.vocab_size:
+    # Resize embeddings nếu tokenizer có vocab khác base model (medical vocab)
+    if len(tokenizer) != base_model.config.vocab_size:
         print(f"Resizing embeddings: {base_model.config.vocab_size} -> {len(tokenizer)}")
         base_model.resize_token_embeddings(len(tokenizer))
 

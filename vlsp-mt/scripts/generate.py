@@ -342,6 +342,12 @@ def main():
         torch_dtype=dtype,
         attn_implementation=attn_impl,
     )
+    
+    # Resize embeddings nếu tokenizer có vocab khác base model (medical vocab)
+    if len(tokenizer) != base.config.vocab_size:
+        print(f"Resizing embeddings: {base.config.vocab_size} -> {len(tokenizer)}")
+        base.resize_token_embeddings(len(tokenizer))
+    
     model = PeftModel.from_pretrained(base, args.adapter_path)
     model.eval()
     
