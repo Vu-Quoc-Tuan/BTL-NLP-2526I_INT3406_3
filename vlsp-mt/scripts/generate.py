@@ -129,8 +129,9 @@ def postprocess_en(text: str) -> str:
 
 
 
+# Pattern cho cả 2 format: có và không có special token markers
 ASSISTANT_PATTERN = re.compile(
-    r"<\|im_start\|>assistant\s*(.*?)(?:<\|im_end\|>|$)",
+    r"(?:<\|im_start\|>)?assistant\s*(.*?)(?:<\|im_end\|>|$)",
     re.DOTALL | re.IGNORECASE
 )
 
@@ -157,11 +158,23 @@ STRICT_SEPARATOR_STR = (
 )
 
 def extract_translation(full_text: str, src_text: str = None, direction: str = "en2vi") -> str:
-    # 1) Lấy block assistant cuối (memory-friendly)
+    """Extract translation from model output, handling both special token formats."""
+    
+    # 1) Tìm vị trí "assistant" cuối cùng và lấy text sau nó
+    # Handle cả format có <|im_start|> và không có
     last = None
     for m in ASSISTANT_PATTERN.finditer(full_text):
         last = m
-    hyp = last.group(1).strip() if last else full_text.strip()
+    
+    if last:
+        hyp = last.group(1).strip()
+    else:
+        # Fallback: tìm "assistant" keyword và lấy phần sau
+        assistant_idx = full_text.lower().rfind("assistant")
+        if assistant_idx != -1:
+            hyp = full_text[assistant_idx + len("assistant"):].strip()
+        else:
+            hyp = full_text.strip()
 
     # 2) Source repetition (dynamic)
     if src_text:
@@ -186,7 +199,7 @@ def extract_translation(full_text: str, src_text: str = None, direction: str = "
         hyp = new
 
     # 4) Stop markers (earliest cut)
-    stop_markers = ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]
+    stop_markers = ["<|im_end|>", "<|endoftext|>", "<|im_start|>", "system", "user"]
     if direction == "en2vi":
         stop_markers += ["\nEnglish:", "English:"]
     elif direction == "vi2en":
@@ -265,8 +278,8 @@ def generate_batch(
                 use_cache=True,
             )
     
-    # Decode
-    generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    # Decode - giữ special tokens để extract_translation hoạt động đúng
+    generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=False)
     
     # Extract translations
     translations = []

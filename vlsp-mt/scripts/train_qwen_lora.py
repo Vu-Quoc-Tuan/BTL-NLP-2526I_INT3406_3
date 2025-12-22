@@ -481,14 +481,19 @@ def main():
     num_added_toks = 0
     if args.medical_vocab:
         if os.path.isfile(args.medical_vocab):
-            # Load từ file txt (mỗi dòng 1 từ)
             print(f"Loading medical vocabulary from: {args.medical_vocab}")
             with open(args.medical_vocab, encoding="utf8") as f:
-                new_tokens = [line.strip() for line in f if line.strip()]
+                new_tokens = []
+                for line in f:
+                    t = line.strip()
+                    # bỏ dòng trống + comment/header
+                    if not t or t.startswith("#"):
+                        continue
+                    new_tokens.append(t)
         else:
             print(f"[WARNING] Medical vocab file not found: {args.medical_vocab}")
             new_tokens = []
-        
+
         if new_tokens:
             num_added_toks = tokenizer.add_tokens(new_tokens)
             if num_added_toks > 0:
@@ -496,6 +501,7 @@ def main():
                 print(f"[INFO] New vocab size: {len(tokenizer)}")
             else:
                 print("[INFO] All medical tokens already exist in vocabulary.")
+
 
     # ============================================================
     # Load model
@@ -660,10 +666,10 @@ def main():
         logging_first_step=True,
         
         # Saving & Evaluation - ĐỒNG BỘ để load_best_model hoạt động đúng
-        save_strategy="steps" if eval_tokenized else "steps",
+        save_strategy="steps",
         save_steps=eval_save_steps,
         save_total_limit=5,  # Giữ 5 checkpoint để không mất best model
-        eval_strategy="steps" if eval_tokenized else "no",
+        evaluation_strategy="steps" if eval_tokenized else "no",
         eval_steps=eval_save_steps if eval_tokenized else None,
         load_best_model_at_end=True if eval_tokenized else False,
         # LUÔN dùng eval_loss để chọn best model (ổn định hơn BLEU)
