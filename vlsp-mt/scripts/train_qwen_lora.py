@@ -132,12 +132,9 @@ class NEFTuneTrainer(Trainer):
         
         def neftune_hook(module, input, output):
             if module.training:
-                dims = torch.tensor(
-                    output.size(1) * output.size(2), 
-                    device=output.device,
-                    dtype=output.dtype
-                )
-                mag_norm = neftune_alpha / torch.sqrt(dims)
+                # FIX: Tối ưu - không dùng tensor cho phép tính đơn giản
+                seq_len, hidden = output.size(1), output.size(2)
+                mag_norm = neftune_alpha / (seq_len * hidden) ** 0.5
                 noise = torch.zeros_like(output).uniform_(-1, 1) * mag_norm
                 output = output + noise
             return output
@@ -191,7 +188,8 @@ class BLEUEvalMixin:
             batch_src = src_samples[i:i+batch_size]
             batch_prompts = [build_prompt(s) for s in batch_src]
             
-            # Tokenize
+            # Tokenize với left padding cho generation
+            tokenizer.padding_side = "left"
             inputs = tokenizer(
                 batch_prompts, 
                 return_tensors="pt", 
@@ -210,9 +208,10 @@ class BLEUEvalMixin:
                     eos_token_id=tokenizer.eos_token_id,
                 )
             
-            # Decode - chỉ lấy phần generated (bỏ prompt)
+            # Decode - FIX: dùng attention_mask để tính prompt_len chính xác
             for j, output in enumerate(outputs):
-                prompt_len = inputs.input_ids[j].shape[0]
+                # Số token thực (không pad) = sum của attention_mask
+                prompt_len = inputs.attention_mask[j].sum().item()
                 generated = output[prompt_len:]
                 text = tokenizer.decode(generated, skip_special_tokens=True).strip()
                 predictions.append(text)
@@ -242,12 +241,7 @@ class BLEUEvalTrainer(Trainer, BLEUEvalMixin):
         # Gọi evaluate gốc của Trainer để lấy loss
         output = Trainer.evaluate(self, eval_dataset, ignore_keys, metric_key_prefix)
         
-        # Debug info
-        print(f"\n[DEBUG] eval_src_texts len: {len(self.eval_src_texts)}")
-        print(f"[DEBUG] eval_tgt_texts len: {len(self.eval_tgt_texts)}")
-        print(f"[DEBUG] bleu_metric: {self.bleu_metric is not None}")
-        
-        # Tính BLEU - LUÔN thêm eval_bleu vào output
+        # Tính BLEU nếu có data (chỉ để theo dõi, không dùng cho best model)
         if self.eval_src_texts and self.eval_tgt_texts and self.bleu_metric:
             try:
                 bleu_score = self._compute_bleu()
@@ -255,13 +249,6 @@ class BLEUEvalTrainer(Trainer, BLEUEvalMixin):
                 print(f"\n>>> BLEU Score: {bleu_score:.2f}")
             except Exception as e:
                 print(f"\n[WARNING] BLEU computation failed: {e}")
-                import traceback
-                traceback.print_exc()
-                output[f"{metric_key_prefix}_bleu"] = 0.0
-        else:
-            # Fallback: thêm eval_bleu = 0 để tránh KeyError
-            print(f"\n[WARNING] BLEU skipped - missing data")
-            output[f"{metric_key_prefix}_bleu"] = 0.0
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -296,12 +283,9 @@ class NEFTuneBLEUTrainer(Trainer, BLEUEvalMixin):
         
         def neftune_hook(module, input, output):
             if module.training:
-                dims = torch.tensor(
-                    output.size(1) * output.size(2), 
-                    device=output.device,
-                    dtype=output.dtype
-                )
-                mag_norm = neftune_alpha / torch.sqrt(dims)
+                # FIX: Tối ưu - không dùng tensor cho phép tính đơn giản
+                seq_len, hidden = output.size(1), output.size(2)
+                mag_norm = neftune_alpha / (seq_len * hidden) ** 0.5
                 noise = torch.zeros_like(output).uniform_(-1, 1) * mag_norm
                 output = output + noise
             return output
@@ -321,12 +305,7 @@ class NEFTuneBLEUTrainer(Trainer, BLEUEvalMixin):
         # Gọi evaluate gốc của Trainer
         output = Trainer.evaluate(self, eval_dataset, ignore_keys, metric_key_prefix)
         
-        # Debug info
-        print(f"\n[DEBUG] eval_src_texts len: {len(self.eval_src_texts)}")
-        print(f"[DEBUG] eval_tgt_texts len: {len(self.eval_tgt_texts)}")
-        print(f"[DEBUG] bleu_metric: {self.bleu_metric is not None}")
-        
-        # Tính BLEU - LUÔN thêm eval_bleu vào output
+        # Tính BLEU nếu có data (chỉ để theo dõi, không dùng cho best model)
         if self.eval_src_texts and self.eval_tgt_texts and self.bleu_metric:
             try:
                 bleu_score = self._compute_bleu()
@@ -334,13 +313,6 @@ class NEFTuneBLEUTrainer(Trainer, BLEUEvalMixin):
                 print(f"\n>>> BLEU Score: {bleu_score:.2f}")
             except Exception as e:
                 print(f"\n[WARNING] BLEU computation failed: {e}")
-                import traceback
-                traceback.print_exc()
-                output[f"{metric_key_prefix}_bleu"] = 0.0
-        else:
-            # Fallback: thêm eval_bleu = 0 để tránh KeyError
-            print(f"\n[WARNING] BLEU skipped - missing data")
-            output[f"{metric_key_prefix}_bleu"] = 0.0
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -378,7 +350,7 @@ def main():
     p.add_argument("--batch_size", type=int, default=4, help="Per-device batch size")
     p.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps")
     p.add_argument("--epochs", type=int, default=2, help="Number of epochs (2 recommended for NEFTune)")
-    p.add_argument("--warmup_ratio", type=float, default=0.005, help="Warmup ratio")
+    p.add_argument("--warmup_ratio", type=float, default=0.03, help="Warmup ratio")
     p.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     p.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
     p.add_argument("--eval_steps", type=int, default=1000, 
@@ -545,7 +517,7 @@ def main():
         remove_columns=["src", "tgt"],
         desc="Tokenizing train",
     )
-    train_tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    # Không cần set_format - để DataCollator tự xử lý
 
     # Validation set
     eval_tokenized = None
@@ -566,7 +538,7 @@ def main():
             remove_columns=["src", "tgt"],
             desc="Tokenizing val",
         )
-        eval_tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+        # Không cần set_format - để DataCollator tự xử lý
 
     # ============================================================
     # Training arguments
@@ -620,14 +592,15 @@ def main():
         eval_strategy="steps" if eval_tokenized else "no",
         eval_steps=eval_save_steps if eval_tokenized else None,
         load_best_model_at_end=True if eval_tokenized else False,
-        # Dùng BLEU nếu bật --eval_bleu, ngược lại dùng loss
-        metric_for_best_model="eval_bleu" if (eval_tokenized and args.eval_bleu) else ("eval_loss" if eval_tokenized else None),
-        greater_is_better=True if args.eval_bleu else False,  # BLEU cao = tốt, loss thấp = tốt
+        # LUÔN dùng eval_loss để chọn best model (ổn định hơn BLEU)
+        # BLEU chỉ để theo dõi, không dùng cho early stopping
+        metric_for_best_model="eval_loss" if eval_tokenized else None,
+        greater_is_better=False,  # loss thấp = tốt
         
         # Performance optimizations for A100
-        dataloader_num_workers=12,
+        dataloader_num_workers=4,  # Giảm từ 12 xuống 4 để tránh overhead
         dataloader_pin_memory=True,
-        dataloader_prefetch_factor=4,
+        dataloader_prefetch_factor=2,  # Giảm từ 4 xuống 2
         gradient_checkpointing=not args.no_grad_checkpoint,
         gradient_checkpointing_kwargs={"use_reentrant": False} if not args.no_grad_checkpoint else None,
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
