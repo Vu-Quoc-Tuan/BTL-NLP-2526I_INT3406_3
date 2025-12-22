@@ -669,7 +669,7 @@ def main():
         save_strategy="steps",
         save_steps=eval_save_steps,
         save_total_limit=5,  # Giữ 5 checkpoint để không mất best model
-        evaluation_strategy="steps" if eval_tokenized else "no",
+        eval_strategy="steps" if eval_tokenized else "no",
         eval_steps=eval_save_steps if eval_tokenized else None,
         load_best_model_at_end=True if eval_tokenized else False,
         # LUÔN dùng eval_loss để chọn best model (ổn định hơn BLEU)
