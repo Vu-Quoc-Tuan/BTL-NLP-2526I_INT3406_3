@@ -1,4 +1,6 @@
-# Medical Vocabulary - Từ chuyên ngành y tế
+# Medical Vocabulary - Từ chuyên ngành y tế (EN + VI)
+
+# ===== ENGLISH TERMS =====
 # Thuốc / Dược phẩm
 acetaminophen
 ibuprofen
@@ -24,7 +26,6 @@ myocarditis
 pericarditis
 
 # Hội chứng
-syndrome
 MINOCA
 ARDS
 sepsis
@@ -47,7 +48,7 @@ embolization
 catheterization
 intubation
 
-# Giải phẫu / Cơ quan
+# Giải phẫu
 myocardial
 cardiovascular
 gastrointestinal
@@ -56,5 +57,51 @@ cerebrospinal
 hepatobiliary
 genitourinary
 pulmonary
-renal
 pancreatic
+
+# ===== VIETNAMESE TERMS =====
+# Bệnh lý
+viêm màng não
+viêm nội tâm mạc
+viêm phổi
+gan lách to
+viêm cầu thận
+bệnh cơ tim
+bệnh não
+bệnh thần kinh
+viêm cơ tim
+viêm màng ngoài tim
+
+# Triệu chứng
+khó thở
+đau ngực
+sốt cao
+ho khan
+mệt mỏi
+chóng mặt
+buồn nôn
+tiêu chảy
+táo bón
+phù nề
+
+# Phẫu thuật
+phẫu thuật nội soi
+sinh thiết
+cắt bỏ
+nối mạch
+đặt stent
+thông tim
+đặt nội khí quản
+mở khí quản
+
+# Cơ quan
+tim mạch
+tiêu hóa
+hô hấp
+thần kinh
+tiết niệu
+gan mật
+tụy tạng
+thận
+phổi
+não
