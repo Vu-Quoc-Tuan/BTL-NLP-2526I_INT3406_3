@@ -2,7 +2,7 @@
 
 Phần này trình bày kết quả thực nghiệm của mô hình dịch máy y sinh sử dụng **Qwen 2.5 + LoRA + Supervised Fine-Tuning (SFT) + Reinforcement Learning (GRPO)**.  
 Mô hình được đánh giá trên hai hướng dịch **Anh → Việt** và **Việt → Anh**, với ba tập dữ liệu: **validation**, **public test** và **unseen test**.
----
+
 ## Anh → Việt (EN → VI)
 
 ### Tập validation
