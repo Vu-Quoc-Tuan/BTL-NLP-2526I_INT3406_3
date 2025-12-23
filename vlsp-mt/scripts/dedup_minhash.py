@@ -22,9 +22,6 @@ def get_smart_threshold(text: str) -> float:
     """
     text_lower = text.lower()
     
-    # DANH SÁCH ĐƠN VỊ Y KHOA NHẠY CẢM (Cần bảo vệ tuyệt đối)
-    # Regex này bắt: Số + khoảng trắng (tùy chọn) + đơn vị
-    # Ví dụ bắt: "5mg", "5 mg", "120/80 mmHg", "38.5 độ", "95%"
     sensitive_pattern = r'\d+\.?\d*\s*(mg|g|kg|ml|l|mmol|mol|iu|ui|mmhg|cmh2o|bpm|%|độ|degree|viên|tablets?|capsules?|liều|gói|ống|chai|lọ|mcg|µg|ng|pg|meq|units?)'
     
     if re.search(sensitive_pattern, text_lower):

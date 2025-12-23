@@ -1,7 +1,4 @@
-# Medical Vocabulary - Từ chuyên ngành y tế (EN + VI)
 
-# ===== ENGLISH TERMS =====
-# Thuốc / Dược phẩm
 acetaminophen
 ibuprofen
 hydroxychloroquine
@@ -13,7 +10,6 @@ amoxicillin
 ciprofloxacin
 vancomycin
 
-# Bệnh lý
 meningitis
 endocarditis
 pneumonia
@@ -25,7 +21,6 @@ neuropathy
 myocarditis
 pericarditis
 
-# Hội chứng
 MINOCA
 ARDS
 sepsis
@@ -36,7 +31,6 @@ infarction
 hemorrhage
 aneurysm
 
-# Phẫu thuật / Thủ thuật
 thoracotomy
 laparoscopy
 angiography
@@ -48,7 +42,6 @@ embolization
 catheterization
 intubation
 
-# Giải phẫu
 myocardial
 cardiovascular
 gastrointestinal
@@ -59,8 +52,7 @@ genitourinary
 pulmonary
 pancreatic
 
-# ===== VIETNAMESE TERMS =====
-# Bệnh lý
+
 viêm màng não
 viêm nội tâm mạc
 viêm phổi
@@ -72,7 +64,6 @@ bệnh thần kinh
 viêm cơ tim
 viêm màng ngoài tim
 
-# Triệu chứng
 khó thở
 đau ngực
 sốt cao
@@ -84,7 +75,6 @@ tiêu chảy
 táo bón
 phù nề
 
-# Phẫu thuật
 phẫu thuật nội soi
 sinh thiết
 cắt bỏ
@@ -94,7 +84,6 @@ thông tim
 đặt nội khí quản
 mở khí quản
 
-# Cơ quan
 tim mạch
 tiêu hóa
 hô hấp
