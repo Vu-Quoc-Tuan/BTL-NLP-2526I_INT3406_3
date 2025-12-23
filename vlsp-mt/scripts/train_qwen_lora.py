@@ -384,6 +384,10 @@ def main():
     p.add_argument("--init_new_embeddings_avg", action="store_true",
                    help="Initialize new token embeddings with average of existing (faster convergence)")
     
+    # Resume from checkpoint
+    p.add_argument("--resume_from", type=str, default=None,
+                   help="Path to adapter checkpoint to resume training from (local or HuggingFace)")
+    
     args = p.parse_args()
     
     # Set seed
@@ -490,26 +494,71 @@ def main():
 
 
     # ============================================================
-    # Setup LoRA
+    # Setup LoRA - hoặc load từ checkpoint nếu resume
     # ============================================================
-    # Target all linear layers for maximum learning capacity
-    target_modules = [
-        "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
-        "gate_proj", "up_proj", "down_proj"       # MLP
-    ]
+    from peft import PeftModel
     
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=target_modules,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        # RSLoRA: scales alpha by sqrt(r) for better training dynamics
-        use_rslora=True,
-    )
-    
-    model = get_peft_model(model, lora_config)
+    if args.resume_from:
+        # Resume từ adapter checkpoint
+        print(f"Resuming from adapter: {args.resume_from}")
+        
+        # Parse HF path với subfolder
+        def parse_hf_path(path):
+            if os.path.exists(path):
+                return path, None
+            if path.startswith("runs/") or path.startswith("./") or path.startswith("../"):
+                return path, None
+            parts = path.split('/')
+            if len(parts) > 2:
+                return '/'.join(parts[:2]), '/'.join(parts[2:])
+            return path, None
+        
+        adapter_repo, adapter_subfolder = parse_hf_path(args.resume_from)
+        
+        # Load tokenizer từ adapter nếu có (để giữ medical vocab)
+        try:
+            if adapter_subfolder:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    adapter_repo, subfolder=adapter_subfolder, use_fast=False
+                )
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(adapter_repo, use_fast=False)
+            print(f"Loaded tokenizer from adapter checkpoint")
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+        except Exception:
+            print("No tokenizer in adapter, using base model tokenizer")
+        
+        # Resize embeddings nếu cần
+        if len(tokenizer) != model.config.vocab_size:
+            print(f"Resizing embeddings: {model.config.vocab_size} -> {len(tokenizer)}")
+            model.resize_token_embeddings(len(tokenizer))
+        
+        # Load adapter
+        model = PeftModel.from_pretrained(
+            model, adapter_repo, subfolder=adapter_subfolder, is_trainable=True
+        )
+        print("Loaded adapter weights, continuing training...")
+    else:
+        # Train từ đầu với LoRA mới
+        # Target all linear layers for maximum learning capacity
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
+            "gate_proj", "up_proj", "down_proj"       # MLP
+        ]
+        
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            # RSLoRA: scales alpha by sqrt(r) for better training dynamics
+            use_rslora=True,
+        )
+        
+        model = get_peft_model(model, lora_config)
     
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
@@ -714,6 +763,10 @@ def main():
     tokenizer.save_pretrained(adapter_save_path)
 
     # Save training metadata
+    # Get target_modules from model config if resumed
+    if args.resume_from:
+        target_modules = list(model.peft_config["default"].target_modules)
+    
     meta = {
         **vars(args),
         "trainable_params": trainable_params,

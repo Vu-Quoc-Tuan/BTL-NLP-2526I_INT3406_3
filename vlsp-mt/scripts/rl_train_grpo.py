@@ -14,8 +14,12 @@ def parse_hf_path(path):
     Input: 'user/repo/subfolder/path' hoặc 'local/path'
     Output: (repo_id, subfolder) hoặc (local_path, None)
     """
-    # Nếu là local path
+    # Nếu là local path (check cả absolute và relative)
     if os.path.exists(path):
+        return path, None
+    
+    # Check nếu bắt đầu bằng "runs/" hoặc "./" hoặc "../" → local path
+    if path.startswith("runs/") or path.startswith("./") or path.startswith("../"):
         return path, None
     
     # Nếu là HF path với subfolder (có nhiều hơn 2 phần)
@@ -51,28 +55,79 @@ def build_prompt_vi2en(src):
     )
 
 
-def sentence_reward(hyp, ref, alpha=0.3, beta=0.4, gamma=0.3):
+def sentence_reward(hyp, ref, alpha=0.2, beta=0.4, gamma=0.4):
     """
     Compute reward as weighted combination of BLEU, chrF, and chrF++.
     Giảm weight BLEU vì sentence-level BLEU rất noisy.
-    chrF ổn định hơn cho translation.
+    chrF và chrF++ ổn định hơn cho translation.
+    
+    Updated weights: BLEU 0.2, chrF 0.4, chrF++ 0.4
     """
     if not hyp.strip():
-        return 0.0
+        return -0.5  # Phạt nặng hơn cho empty output
     
-    # Length penalty: phạt nếu quá ngắn hoặc quá dài so với ref
+    # Length ratio penalty (smooth)
     len_ratio = len(hyp) / max(len(ref), 1)
-    if len_ratio < 0.5 or len_ratio > 2.0:
-        length_penalty = 0.8
+    if len_ratio < 0.3:
+        length_penalty = 0.3
+    elif len_ratio < 0.5:
+        length_penalty = 0.6
+    elif len_ratio > 3.0:
+        length_penalty = 0.3
+    elif len_ratio > 2.0:
+        length_penalty = 0.6
+    elif len_ratio > 1.5:
+        length_penalty = 0.85
     else:
         length_penalty = 1.0
     
+    # Repetition penalty: detect repeated n-grams
+    words = hyp.lower().split()
+    if len(words) > 3:
+        bigrams = [tuple(words[i:i+2]) for i in range(len(words)-1)]
+        unique_bigrams = set(bigrams)
+        repetition_ratio = len(unique_bigrams) / max(len(bigrams), 1)
+        if repetition_ratio < 0.5:  # More than 50% repeated bigrams
+            repetition_penalty = 0.5
+        elif repetition_ratio < 0.7:
+            repetition_penalty = 0.8
+        else:
+            repetition_penalty = 1.0
+    else:
+        repetition_penalty = 1.0
+    
+    # Copy penalty: phạt nếu output giống input quá nhiều (không dịch)
+    hyp_words = set(hyp.lower().split())
+    ref_words = set(ref.lower().split())
+    if len(hyp_words) > 0 and len(ref_words) > 0:
+        overlap = len(hyp_words & ref_words) / len(hyp_words)
+        if overlap > 0.95:
+            copy_penalty = 0.5
+        elif overlap > 0.85:
+            copy_penalty = 0.7
+        else:
+            copy_penalty = 1.0
+    else:
+        copy_penalty = 1.0
+    
+    # Compute metrics
     bleu = sacrebleu.sentence_bleu(hyp, [ref], smooth_method='exp').score / 100.0
     chrf = sacrebleu.sentence_chrf(hyp, [ref]).score / 100.0
     chrf_pp = sacrebleu.sentence_chrf(hyp, [ref], word_order=2).score / 100.0
     
-    reward = alpha * bleu + beta * chrf + gamma * chrf_pp
-    return reward * length_penalty
+    # Base reward
+    base_reward = alpha * bleu + beta * chrf + gamma * chrf_pp
+    
+    # Quality bonus cho high-quality translations
+    if bleu > 0.4 and chrf > 0.5 and chrf_pp > 0.5:
+        quality_bonus = 0.05
+    else:
+        quality_bonus = 0.0
+    
+    final_reward = (base_reward + quality_bonus) * length_penalty * copy_penalty * repetition_penalty
+    
+    # Clamp to reasonable range
+    return max(-0.5, min(1.0, final_reward))
 
 
 def batch_sentence_rewards(hyps, refs, alpha=0.5, beta=0.3, gamma=0.2):
@@ -189,6 +244,34 @@ def get_logprobs_batch_vectorized(model, tokenizer, prompts, gen_texts, device):
     return avg_log_probs, stats
 
 
+def compute_group_advantages(rewards, group_size):
+    """
+    GRPO: Compute advantages relative to group mean.
+    Thay vì dùng global baseline, so sánh trong group.
+    
+    Args:
+        rewards: list of rewards [batch_size * group_size]
+        group_size: number of samples per source sentence
+    
+    Returns:
+        advantages: normalized advantages
+    """
+    rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+    batch_size = len(rewards) // group_size
+    
+    # Reshape thành [batch_size, group_size]
+    rewards_grouped = rewards_tensor.view(batch_size, group_size)
+    
+    # Group mean và std
+    group_mean = rewards_grouped.mean(dim=1, keepdim=True)
+    group_std = rewards_grouped.std(dim=1, keepdim=True).clamp(min=1e-6)
+    
+    # Normalize trong group
+    advantages = (rewards_grouped - group_mean) / group_std
+    
+    return advantages.view(-1)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model_name", required=True)
@@ -198,20 +281,23 @@ def main():
     p.add_argument("--rl_tgt", required=True)
     p.add_argument("--run_id", required=True)
     p.add_argument("--direction", choices=["en2vi", "vi2en"], required=True)
-    p.add_argument("--alpha", type=float, default=0.5, help="BLEU weight in reward")
-    p.add_argument("--beta", type=float, default=0.3, help="chrF weight in reward")
-    p.add_argument("--gamma", type=float, default=0.2, help="chrF++ weight in reward")
-    p.add_argument("--kl_coef", type=float, default=0.1, help="KL penalty coefficient (0.1 recommended)")
-    p.add_argument("--lr", type=float, default=1e-6)
-    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--alpha", type=float, default=0.2, help="BLEU weight in reward (reduced - noisy)")
+    p.add_argument("--beta", type=float, default=0.4, help="chrF weight in reward")
+    p.add_argument("--gamma", type=float, default=0.4, help="chrF++ weight in reward")
+    p.add_argument("--kl_coef", type=float, default=0.1, help="KL penalty coefficient")
+    p.add_argument("--entropy_coef", type=float, default=0.01, help="Entropy bonus coefficient")
+    p.add_argument("--lr", type=float, default=5e-7)
+    p.add_argument("--batch_size", type=int, default=4, help="Number of source sentences per batch")
+    p.add_argument("--group_size", type=int, default=4, help="GRPO: samples per source sentence")
     p.add_argument("--grad_accum_steps", type=int, default=8)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--max_new_tokens", type=int, default=96)  # Tăng từ 64
-    p.add_argument("--temperature", type=float, default=0.4)
-    p.add_argument("--baseline_decay", type=float, default=0.99)
+    p.add_argument("--max_new_tokens", type=int, default=96)
+    p.add_argument("--temperature", type=float, default=0.7, help="Higher for more diverse samples")
+    p.add_argument("--baseline_decay", type=float, default=0.95)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_interval", type=int, default=500)
+    p.add_argument("--use_grpo", action="store_true", help="Use Group Relative Policy Optimization")
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -326,6 +412,10 @@ def main():
     baseline = 0.0
     global_step = 0
     best_reward = 0.0  # Track best reward để save best model
+    
+    # Effective batch size với GRPO
+    effective_batch = args.batch_size * args.group_size if args.use_grpo else args.batch_size
+    print(f"GRPO mode: {args.use_grpo}, Effective batch size: {effective_batch}")
 
     # ============================================================
     # Training Loop
@@ -341,7 +431,16 @@ def main():
             batch = data[i:i + args.batch_size]
             srcs = [s for s, _ in batch]
             refs = [r for _, r in batch]
-            prompts = [build_prompt(s) for s in srcs]
+            
+            # GRPO: Duplicate sources for multiple samples
+            if args.use_grpo:
+                srcs_expanded = [s for s in srcs for _ in range(args.group_size)]
+                refs_expanded = [r for r in refs for _ in range(args.group_size)]
+                prompts = [build_prompt(s) for s in srcs_expanded]
+            else:
+                srcs_expanded = srcs
+                refs_expanded = refs
+                prompts = [build_prompt(s) for s in srcs]
 
             # Batch generation với Left Padding
             # add_special_tokens=False vì prompt ChatML đã có tags
@@ -363,14 +462,14 @@ def main():
                     **inputs,
                     do_sample=True,
                     temperature=args.temperature,
-                    top_p=0.95,
-                    top_k=30,  # Giảm từ 50 để ít random hơn
+                    top_p=0.92,
+                    top_k=40,
                     max_new_tokens=args.max_new_tokens,
-                    min_new_tokens=5,  # Tăng từ 1 để tránh output quá ngắn
+                    min_new_tokens=5,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     use_cache=True,
-                    repetition_penalty=1.15,  # Tăng từ 1.1
+                    repetition_penalty=1.1,
                 )
 
             # Robust Decoding: Slice tensor theo input_width thay vì string split
@@ -379,7 +478,7 @@ def main():
             hyps = [h.strip() for h in hyps]
 
             # Compute rewards
-            rewards = batch_sentence_rewards(hyps, refs, args.alpha, args.beta, args.gamma)
+            rewards = batch_sentence_rewards(hyps, refs_expanded, args.alpha, args.beta, args.gamma)
             batch_avg_reward = sum(rewards) / len(rewards)
             baseline = args.baseline_decay * baseline + (1 - args.baseline_decay) * batch_avg_reward
             epoch_rewards.extend(rewards)
@@ -404,30 +503,44 @@ def main():
             tokenizer.padding_side = "left"
 
             # ============================================================
-            # Loss: REINFORCE + Quadratic KL Penalty (L2 Approx)
-            # Ổn định hơn và rẻ hơn exp formulation
+            # Loss: GRPO or REINFORCE + KL Penalty + Entropy Bonus
             # ============================================================
             
-            # Clip rewards và tính advantage
             rewards_tensor = torch.tensor(rewards, device=device, dtype=torch.float32)
             rewards_clipped = torch.clamp(rewards_tensor, 0.0, 1.0)
-            advantage = rewards_clipped - baseline
             
-            # KL divergence: Quadratic approximation (L2)
-            # 0.5 * (log_pi - log_ref)^2 ≈ KL khi policy gần ref
+            # Compute advantages
+            if args.use_grpo:
+                # GRPO: Group-relative advantages
+                advantage = compute_group_advantages(rewards, args.group_size).to(device)
+            else:
+                # Standard baseline subtraction
+                advantage = rewards_clipped - baseline
+            
+            # KL divergence: Approximate KL using log ratio
+            # KL(π||π_ref) ≈ (π/π_ref - 1) - log(π/π_ref)
             log_ratio = policy_lp - ref_lp.detach()
-            kl = 0.5 * (log_ratio ** 2)
+            ratio = torch.exp(log_ratio)
+            kl = (ratio - 1) - log_ratio  # More stable than exp formulation
+            kl = kl.clamp(min=0)  # KL should be non-negative
             
-            # Loss = - (Advantage * log_pi) + beta * KL
-            # Detach advantage để không backprop qua nó
-            loss = -(advantage.detach() * policy_lp) + args.kl_coef * kl
-            total_loss = loss.mean()
+            # Entropy bonus: Encourage exploration
+            # Approximate entropy from log probs (higher log prob = lower entropy)
+            entropy = -policy_lp  # Simplified: negative log prob as proxy
+            
+            # Loss = - (Advantage * log_pi) + beta * KL - alpha * Entropy
+            policy_loss = -(advantage.detach() * policy_lp)
+            kl_loss = args.kl_coef * kl
+            entropy_bonus = -args.entropy_coef * entropy
+            
+            total_loss = (policy_loss + kl_loss + entropy_bonus).mean()
             
             # Scale loss for gradient accumulation
             scaled_loss = total_loss / args.grad_accum_steps
             scaled_loss.backward()
             
             batch_loss = total_loss.item()
+            batch_kl = kl.mean().item()
 
             # Gradient step
             if (batch_idx + 1) % args.grad_accum_steps == 0:
@@ -445,7 +558,7 @@ def main():
                     pbar.set_postfix({
                         'loss': f'{avg_loss:.4f}',
                         'reward': f'{avg_reward:.4f}',
-                        'baseline': f'{baseline:.4f}',
+                        'kl': f'{batch_kl:.4f}',
                         'skip%': f'{policy_stats["skip_rate"]*100:.1f}',
                         'gen_len': f'{policy_stats["avg_gen_len"]:.1f}'
                     })

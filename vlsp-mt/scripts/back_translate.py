@@ -27,8 +27,12 @@ def parse_hf_path(path):
     Input: 'user/repo/subfolder/path' hoặc 'local/path'
     Output: (repo_id, subfolder) hoặc (local_path, None)
     """
-    # Nếu là local path
+    # Nếu là local path (check cả absolute và relative)
     if os.path.exists(path):
+        return path, None
+    
+    # Check nếu bắt đầu bằng "runs/" hoặc "./" hoặc "../" → local path
+    if path.startswith("runs/") or path.startswith("./") or path.startswith("../"):
         return path, None
     
     # Nếu là HF path với subfolder (có nhiều hơn 2 phần)
@@ -287,7 +291,14 @@ def main():
                 f.write(tgt + "\n")
         
         # Save corresponding source (for pairing)
-        src_output = args.output.replace(".en", ".src.vi").replace(".vi", ".src.en")
+        # Fix: chỉ replace 1 lần dựa vào direction
+        if args.output.endswith(".en"):
+            src_output = args.output[:-3] + ".src.vi"
+        elif args.output.endswith(".vi"):
+            src_output = args.output[:-3] + ".src.en"
+        else:
+            src_output = args.output + ".src"
+        
         if src_output != args.output:
             with open(src_output, "w", encoding="utf8") as f:
                 for src, _ in good_pairs:

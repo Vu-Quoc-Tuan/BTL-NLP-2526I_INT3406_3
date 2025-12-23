@@ -14,8 +14,12 @@ def parse_hf_path(path):
     Input: 'user/repo/subfolder/path' hoặc 'local/path'
     Output: (repo_id, subfolder) hoặc (local_path, None)
     """
-    # Nếu là local path
+    # Nếu là local path (check cả absolute và relative)
     if os.path.exists(path):
+        return path, None
+    
+    # Check nếu bắt đầu bằng "runs/" hoặc "./" hoặc "../" → local path
+    if path.startswith("runs/") or path.startswith("./") or path.startswith("../"):
         return path, None
     
     # Nếu là HF path với subfolder (có nhiều hơn 2 phần)
