@@ -61,7 +61,7 @@ def tokenize_example(example, tokenizer, direction, max_len):
     src, tgt = example["src"], example["tgt"]
     prompt = build_prompt_en2vi(src) if direction == "en2vi" else build_prompt_vi2en(src)
     
-    # 1. Tokenize riêng lẻ (không truncate ở đây)
+    # 1. Tokenize riêng lẻ
     prompt_ids = tokenizer(prompt, add_special_tokens=True)["input_ids"]
     target_ids = tokenizer(
         " " + tgt + tokenizer.eos_token, 
@@ -73,8 +73,7 @@ def tokenize_example(example, tokenizer, direction, max_len):
     if len(input_ids) > max_len:
         input_ids = input_ids[:max_len]
     
-    # 3. Tính lại prompt_len thực tế sau khi cắt (QUAN TRỌNG!)
-    # Prompt nằm ở đầu nên thường không bị cắt, trừ khi max_len quá bé
+    # 3. Tính lại prompt_len thực tế sau khi cắt
     real_prompt_len = min(len(prompt_ids), len(input_ids))
     
     # 4. Tạo Labels: -100 cho prompt (no loss), giữ nguyên target
@@ -118,7 +117,6 @@ def make_dataset(src_path, tgt_path, subset=None, shuffle_seed=None):
 class NEFTuneTrainer(Trainer):
     """
     Trainer with NEFTune: adds noise to embeddings during training.
-    Paper: https://arxiv.org/abs/2310.05914
     """
     def __init__(self, neftune_noise_alpha=5.0, **kwargs):
         super().__init__(**kwargs)
@@ -210,7 +208,7 @@ class BLEUEvalMixin:
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=self.gen_max_len,
-                    do_sample=False,  # Greedy for consistency
+                    do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                 )
@@ -411,7 +409,7 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # ============================================================
-    # [NEW] ADD MEDICAL TOKENS - "Tiêm thuốc" cho tokenizer
+    #  ADD MEDICAL TOKENS
     # ============================================================
     num_added_toks = 0
     if args.medical_vocab:
@@ -468,13 +466,13 @@ def main():
     )
     
     # ============================================================
-    # [NEW] RESIZE EMBEDDINGS - Quan trọng! Phải làm sau khi load model
+    # RESIZE EMBEDDINGS
     # ============================================================
     if num_added_toks > 0:
         print(f"[INFO] Resizing model embeddings from {model.config.vocab_size} to {len(tokenizer)}")
         model.resize_token_embeddings(len(tokenizer))
         
-        # [Mẹo nâng cao] Khởi tạo embedding mới bằng trung bình cộng để hội tụ nhanh hơn
+        # Khởi tạo embedding mới bằng trung bình cộng để hội tụ nhanh hơn
         if args.init_new_embeddings_avg:
             print("[INFO] Initializing new embeddings with average of existing embeddings...")
             input_embeddings = model.get_input_embeddings().weight.data
@@ -577,7 +575,6 @@ def main():
         remove_columns=["src", "tgt"],
         desc="Tokenizing train",
     )
-    # Không cần set_format - để DataCollator tự xử lý
 
     # Validation set
     eval_tokenized = None
@@ -598,7 +595,6 @@ def main():
             remove_columns=["src", "tgt"],
             desc="Tokenizing val",
         )
-        # Không cần set_format - để DataCollator tự xử lý
 
     # ============================================================
     # Training arguments
@@ -612,8 +608,8 @@ def main():
     print(f"Total steps: {total_steps}")
 
     # Tính eval_steps và save_steps đồng bộ
-    # Nếu user truyền --eval_steps=0 hoặc không truyền -> auto (2x per epoch)
-    # Nếu user truyền --eval_steps=1000 -> dùng 1000
+    # --eval_steps=0 hoặc không truyền -> auto (2x per epoch)
+    # --eval_steps=1000 -> dùng 1000
     if args.eval_steps > 0:
         eval_save_steps = args.eval_steps
     else:
@@ -648,7 +644,7 @@ def main():
         # Saving & Evaluation - ĐỒNG BỘ để load_best_model hoạt động đúng
         save_strategy="steps",
         save_steps=eval_save_steps,
-        save_total_limit=2,  # Tiết kiệm ổ cứng: chỉ giữ 2 checkpoint gần nhất
+        save_total_limit=2,
         eval_strategy="steps" if eval_tokenized else "no",
         eval_steps=eval_save_steps if eval_tokenized else None,
         load_best_model_at_end=True if eval_tokenized else False,
@@ -657,14 +653,13 @@ def main():
         metric_for_best_model="eval_bleu" if (eval_tokenized and args.eval_bleu) else ("eval_loss" if eval_tokenized else None),
         greater_is_better=True if args.eval_bleu else False,  # BLEU cao = tốt, loss thấp = tốt
         
-        # Performance optimizations for A100
         dataloader_num_workers=12,
         dataloader_pin_memory=True,
         dataloader_prefetch_factor=4,
         gradient_checkpointing=not args.no_grad_checkpoint,
         gradient_checkpointing_kwargs={"use_reentrant": False} if not args.no_grad_checkpoint else None,
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
-        torch_compile=False,  # Disabled - can cause slowdown with LoRA + NEFTune
+        torch_compile=False,
         
         # Other
         remove_unused_columns=False,

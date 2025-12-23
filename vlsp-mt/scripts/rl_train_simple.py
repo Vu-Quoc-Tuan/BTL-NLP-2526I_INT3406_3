@@ -1,7 +1,3 @@
-"""
-Simple REINFORCE for MT - Lightweight version
-Không cần reference model, không GRPO → nhanh và nhẹ
-"""
 import argparse
 import os
 import torch
@@ -44,7 +40,7 @@ def build_prompt_vi2en(src):
 
 
 def compute_reward(hyp, ref):
-    """Simple reward: chrF++ (stable for MT)"""
+    """Simple reward: chrF++"""
     if not hyp.strip():
         return -0.5
     
@@ -94,7 +90,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model - single adapter only (no reference)
+    # Load model - single adapter only
     print("Loading model...")
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
@@ -171,7 +167,7 @@ def main():
             baseline = 0.9 * baseline + 0.1 * avg_reward
             epoch_rewards.extend(rewards)
             
-            # Forward pass for log probs (REINFORCE)
+            # Forward pass for log probs
             full_texts = [p + h for p, h in zip(prompts, hyps)]
             tokenizer.padding_side = "right"
             enc = tokenizer(full_texts, return_tensors="pt", padding=True,

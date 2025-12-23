@@ -212,7 +212,6 @@ def main():
     )
     
     # ============================================================
-    # [FIX] Resize embeddings TRƯỚC KHI load adapter
     # Đảm bảo base model có cùng vocab size với tokenizer đã train
     # ============================================================
     if len(tokenizer) != base.config.vocab_size:
@@ -266,7 +265,6 @@ def main():
 
             gen_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
             
-            # [FIX] Truyền src_text thay vì prompt vào extract_translation
             for full_text, src_text in zip(gen_texts, batch):
                 hyp = extract_translation(full_text, src_text)
                 
@@ -291,7 +289,6 @@ def main():
                 f.write(tgt + "\n")
         
         # Save corresponding source (for pairing)
-        # Fix: chỉ replace 1 lần dựa vào direction
         if args.output.endswith(".en"):
             src_output = args.output[:-3] + ".src.vi"
         elif args.output.endswith(".vi"):

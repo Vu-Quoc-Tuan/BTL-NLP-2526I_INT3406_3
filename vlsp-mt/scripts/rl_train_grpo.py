@@ -14,7 +14,6 @@ def parse_hf_path(path):
     Input: 'user/repo/subfolder/path' hoặc 'local/path'
     Output: (repo_id, subfolder) hoặc (local_path, None)
     """
-    # Nếu là local path (check cả absolute và relative)
     if os.path.exists(path):
         return path, None
     
@@ -148,10 +147,6 @@ def get_logprobs_batch_vectorized(model, tokenizer, prompts, gen_texts, device, 
     gom lại các sample thành 1 batch và chạy
     tự động skip sample nếu mismatch
     Sử dụng mini-batch để tránh OOM
-    
-    Returns:
-        avg_log_probs: tensor [batch_size] - average log prob per token
-        stats: dict with 'skip_rate' and 'avg_gen_len' for debugging
     """
     total_samples = len(prompts)
     all_avg_log_probs = []
@@ -180,12 +175,12 @@ def get_logprobs_batch_vectorized(model, tokenizer, prompts, gen_texts, device, 
             "add_special_tokens": False
         }
         
-        # 1. Tokenize PROMPTS (không truncate để prefix check chính xác)
+        # 1. Tokenize PROMPTS
         prompt_encodings = tokenizer(batch_prompts, **prompt_kwargs).to(device)
         prompt_ids = prompt_encodings.input_ids
         prompt_lens = prompt_encodings.attention_mask.sum(dim=1)
         
-        # 2. Tokenize FULL TEXT (prompt + generation)
+        # 2. Tokenize FULL TEXT
         full_texts = [p + g for p, g in zip(batch_prompts, batch_gen_texts)]
         full_encodings = tokenizer(full_texts, **full_kwargs).to(device)
         input_ids = full_encodings.input_ids
@@ -214,19 +209,19 @@ def get_logprobs_batch_vectorized(model, tokenizer, prompts, gen_texts, device, 
         # 4. Forward Pass
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             outputs = model(input_ids, attention_mask=attention_mask, return_dict=True)
-            logits = outputs.logits.float()
         
-        # 5. Log Softmax & Shift
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        
+        # 5. Dùng cross_entropy thay vì log_softmax + gather (tiết kiệm RAM)
         # Shift: logits[t] dự đoán input[t+1]
-        shift_log_probs = log_probs[:, :-1, :]
-        shift_labels = input_ids[:, 1:]
+        shift_logits = outputs.logits[:, :-1, :].contiguous()  # [B, T-1, V]
+        shift_labels = input_ids[:, 1:].contiguous()           # [B, T-1]
         
-        # Gather logprob của token thực tế
-        token_log_probs = torch.gather(
-            shift_log_probs, 2, shift_labels.unsqueeze(-1)
-        ).squeeze(-1)
+        # cross_entropy trả về NLL, không cần materialize full log_softmax
+        nll = torch.nn.functional.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            reduction="none"
+        )
+        token_log_probs = -nll.view(shift_labels.size(0), shift_labels.size(1))  # [B, T-1]
         
         # 6. Masking (Generation part only)
         seq_len = token_log_probs.shape[1]
@@ -249,7 +244,7 @@ def get_logprobs_batch_vectorized(model, tokenizer, prompts, gen_texts, device, 
         total_gen_len += gen_lens.sum().item()
         
         # Clear intermediate tensors
-        del logits, log_probs, shift_log_probs, token_log_probs
+        del outputs, shift_logits, token_log_probs
     
     # Concatenate all mini-batch results
     final_log_probs = torch.cat(all_avg_log_probs, dim=0)
@@ -420,7 +415,12 @@ def main():
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
     
-    total_steps = max(1, (len(data) // args.batch_size) * args.epochs // args.grad_accum_steps)
+    # FIX: Dùng ceil để tránh OneCycleLR crash khi step vượt total_steps
+    import math
+    num_batches = math.ceil(len(data) / args.batch_size)
+    num_updates_per_epoch = math.ceil(num_batches / args.grad_accum_steps)
+    total_steps = max(1, num_updates_per_epoch * args.epochs)
+    
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=args.lr,
@@ -436,7 +436,7 @@ def main():
     build_prompt = build_prompt_en2vi if args.direction == "en2vi" else build_prompt_vi2en
     baseline = 0.0
     global_step = 0
-    best_reward = 0.0  # Track best reward để save best model
+    best_reward = 0.0
     
     # Effective batch size với GRPO
     effective_batch = args.batch_size * args.group_size if args.use_grpo else args.batch_size
@@ -468,7 +468,6 @@ def main():
                 prompts = [build_prompt(s) for s in srcs]
 
             # Batch generation với Left Padding
-            # add_special_tokens=False vì prompt ChatML đã có tags
             inputs = tokenizer(
                 prompts, 
                 return_tensors="pt", 
