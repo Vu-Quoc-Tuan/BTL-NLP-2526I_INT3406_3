@@ -108,9 +108,16 @@ def main():
 
     model = PeftModel.from_pretrained(base_model, repo, subfolder=subfolder, is_trainable=True)
     model.train()
-    model.gradient_checkpointing_enable()
     
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # Enable gradient checkpointing with proper config
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    
+    # Make sure LoRA params require grad
+    for name, param in model.named_parameters():
+        if "lora" in name.lower():
+            param.requires_grad = True
+    
+    trainable_params = [p for n, p in model.named_parameters() if p.requires_grad and "lora" in n.lower()]
     print(f"Trainable params: {sum(p.numel() for p in trainable_params):,}")
 
     # Data & optimizer
