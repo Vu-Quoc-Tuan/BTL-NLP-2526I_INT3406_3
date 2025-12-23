@@ -18,9 +18,6 @@ from peft import LoraConfig, get_peft_model
 import evaluate
 
 
-
-
-
 def set_seed(seed):
     """Set random seed for reproducibility."""
     random.seed(seed)
@@ -130,6 +127,7 @@ class NEFTuneTrainer(Trainer):
         if self._neftune_hook_handle is not None:
             return
         
+        # FIX: Dùng API chuẩn để lấy embedding layer, bền với mọi kiến trúc
         embed_layer = self.model.get_input_embeddings()
         neftune_alpha = self.neftune_noise_alpha
         
@@ -159,26 +157,57 @@ class NEFTuneTrainer(Trainer):
                 self._neftune_hook_handle = None
     
     def evaluate(self, *args, **kwargs):
-        """Override evaluate to clear CUDA cache after validation."""
+        """Override evaluate to clear CUDA cache after validation to prevent OOM."""
         result = super().evaluate(*args, **kwargs)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return result
 
 
-class BLEUEvalMixin:
-    """Mixin class for BLEU evaluation functionality."""
+class BLEUEvalTrainer(Trainer):
+    """
+    Trainer with BLEU evaluation during training.
+    Generates translations and computes BLEU score.
+    """
+    def __init__(self, eval_src_texts=None, eval_tgt_texts=None, 
+                 direction="en2vi", bleu_metric=None, gen_max_len=128,
+                 bleu_sample_size=200, **kwargs):
+        super().__init__(**kwargs)
+        self.eval_src_texts = eval_src_texts or []
+        self.eval_tgt_texts = eval_tgt_texts or []
+        self.direction = direction
+        self.bleu_metric = bleu_metric
+        self.gen_max_len = gen_max_len
+        self.bleu_sample_size = bleu_sample_size  # Sample để tính BLEU (tiết kiệm thời gian)
     
-    def _get_tokenizer(self):
-        """Get tokenizer compatible with different transformers versions."""
-        if hasattr(self, 'processing_class') and self.processing_class:
-            return self.processing_class
-        return self.tokenizer
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        # Gọi evaluate gốc để lấy loss
+        output = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+        
+        # Debug
+        print(f"\n[DEBUG] eval_src_texts: {len(self.eval_src_texts) if self.eval_src_texts else 0}")
+        print(f"[DEBUG] eval_tgt_texts: {len(self.eval_tgt_texts) if self.eval_tgt_texts else 0}")
+        print(f"[DEBUG] bleu_metric: {self.bleu_metric}")
+        
+        # Tính BLEU nếu có data
+        if self.eval_src_texts and self.eval_tgt_texts and self.bleu_metric:
+            bleu_score = self._compute_bleu()
+            output[f"{metric_key_prefix}_bleu"] = bleu_score
+            print(f"\n>>> BLEU Score: {bleu_score:.2f}")
+        else:
+            print("[WARNING] BLEU not computed - missing data or metric")
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return output
     
     def _compute_bleu(self):
         """Generate translations and compute BLEU."""
         self.model.eval()
-        tokenizer = self._get_tokenizer()
+        
+        # Get tokenizer (compatible with new transformers versions)
+        tokenizer = self.processing_class if hasattr(self, 'processing_class') and self.processing_class else self.tokenizer
         
         # Sample subset để tính BLEU (tránh quá lâu)
         n_samples = min(self.bleu_sample_size, len(self.eval_src_texts))
@@ -223,60 +252,18 @@ class BLEUEvalMixin:
                 predictions.append(text)
         
         # Compute BLEU
-        references = [[ref] for ref in tgt_samples]
-        bleu_result = self.bleu_metric.compute(predictions=predictions, references=references)
-        bleu_score = bleu_result["bleu"] * 100
+        references = [[ref] for ref in tgt_samples]  # BLEU expects list of references
+        result = self.bleu_metric.compute(predictions=predictions, references=references)
         
-        return bleu_score
+        return result["bleu"] * 100  # Convert to percentage
 
 
-class BLEUEvalTrainer(Trainer, BLEUEvalMixin):
-    """Trainer with BLEU evaluation during training."""
-    
-    def __init__(self, eval_src_texts=None, eval_tgt_texts=None, 
-                 direction="en2vi", bleu_metric=None, gen_max_len=128,
-                 bleu_sample_size=200, **kwargs):
-        super().__init__(**kwargs)
-        self.eval_src_texts = list(eval_src_texts) if eval_src_texts else []
-        self.eval_tgt_texts = list(eval_tgt_texts) if eval_tgt_texts else []
-        self.direction = direction
-        self.bleu_metric = bleu_metric
-        self.gen_max_len = gen_max_len
-        self.bleu_sample_size = bleu_sample_size
-    
-    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        # Gọi evaluate gốc để lấy loss
-        output = Trainer.evaluate(self, eval_dataset, ignore_keys, metric_key_prefix)
-        
-        # Tính BLEU nếu có data
-        if self.eval_src_texts and self.eval_tgt_texts and self.bleu_metric:
-            bleu_score = self._compute_bleu()
-            output[f"{metric_key_prefix}_bleu"] = bleu_score
-            print(f"\n>>> BLEU Score: {bleu_score:.2f}")
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        return output
-
-
-class NEFTuneBLEUTrainer(Trainer, BLEUEvalMixin):
+class NEFTuneBLEUTrainer(BLEUEvalTrainer):
     """Combined NEFTune + BLEU evaluation trainer."""
-    
-    def __init__(self, neftune_noise_alpha=5.0, eval_src_texts=None, eval_tgt_texts=None,
-                 direction="en2vi", bleu_metric=None, gen_max_len=128,
-                 bleu_sample_size=200, **kwargs):
+    def __init__(self, neftune_noise_alpha=5.0, **kwargs):
         super().__init__(**kwargs)
-        # NEFTune params
         self.neftune_noise_alpha = neftune_noise_alpha
         self._neftune_hook_handle = None
-        # BLEU params
-        self.eval_src_texts = list(eval_src_texts) if eval_src_texts else []
-        self.eval_tgt_texts = list(eval_tgt_texts) if eval_tgt_texts else []
-        self.direction = direction
-        self.bleu_metric = bleu_metric
-        self.gen_max_len = gen_max_len
-        self.bleu_sample_size = bleu_sample_size
     
     def _setup_neftune_hook(self):
         if self._neftune_hook_handle is not None:
@@ -310,18 +297,8 @@ class NEFTuneBLEUTrainer(Trainer, BLEUEvalMixin):
     
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         """Override evaluate to compute BLEU and clear cache."""
-        # Gọi evaluate của Trainer
-        output = Trainer.evaluate(self, eval_dataset, ignore_keys, metric_key_prefix)
-        
-        # Tính BLEU nếu có data
-        if self.eval_src_texts and self.eval_tgt_texts and self.bleu_metric:
-            bleu_score = self._compute_bleu()
-            output[f"{metric_key_prefix}_bleu"] = bleu_score
-            print(f"\n>>> BLEU Score: {bleu_score:.2f}")
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
+        # Gọi evaluate của BLEUEvalTrainer (đã có logic tính BLEU)
+        output = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
         return output
 
 
@@ -412,19 +389,14 @@ def main():
     num_added_toks = 0
     if args.medical_vocab:
         if os.path.isfile(args.medical_vocab):
+            # Load từ file txt (mỗi dòng 1 từ)
             print(f"Loading medical vocabulary from: {args.medical_vocab}")
             with open(args.medical_vocab, encoding="utf8") as f:
-                new_tokens = []
-                for line in f:
-                    t = line.strip()
-                    # bỏ dòng trống + comment/header
-                    if not t or t.startswith("#"):
-                        continue
-                    new_tokens.append(t)
+                new_tokens = [line.strip() for line in f if line.strip()]
         else:
             print(f"[WARNING] Medical vocab file not found: {args.medical_vocab}")
             new_tokens = []
-
+        
         if new_tokens:
             num_added_toks = tokenizer.add_tokens(new_tokens)
             if num_added_toks > 0:
@@ -432,7 +404,6 @@ def main():
                 print(f"[INFO] New vocab size: {len(tokenizer)}")
             else:
                 print("[INFO] All medical tokens already exist in vocabulary.")
-
 
     # ============================================================
     # Load model
@@ -528,7 +499,7 @@ def main():
         remove_columns=["src", "tgt"],
         desc="Tokenizing train",
     )
-    # Không cần set_format - để DataCollator tự xử lý
+    train_tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
     # Validation set
     eval_tokenized = None
@@ -549,7 +520,7 @@ def main():
             remove_columns=["src", "tgt"],
             desc="Tokenizing val",
         )
-        # Không cần set_format - để DataCollator tự xử lý
+        eval_tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
     # ============================================================
     # Training arguments
@@ -597,14 +568,13 @@ def main():
         logging_first_step=True,
         
         # Saving & Evaluation - ĐỒNG BỘ để load_best_model hoạt động đúng
-        save_strategy="steps",
+        save_strategy="steps" if eval_tokenized else "steps",
         save_steps=eval_save_steps,
         save_total_limit=2,  # Tiết kiệm ổ cứng: chỉ giữ 2 checkpoint gần nhất
         eval_strategy="steps" if eval_tokenized else "no",
         eval_steps=eval_save_steps if eval_tokenized else None,
         load_best_model_at_end=True if eval_tokenized else False,
-        # LUÔN dùng eval_loss để chọn best model (ổn định hơn BLEU)
-        # BLEU chỉ để theo dõi, không dùng cho early stopping
+        # Dùng BLEU nếu bật --eval_bleu, ngược lại dùng loss
         metric_for_best_model="eval_bleu" if (eval_tokenized and args.eval_bleu) else ("eval_loss" if eval_tokenized else None),
         greater_is_better=True if args.eval_bleu else False,  # BLEU cao = tốt, loss thấp = tốt
         

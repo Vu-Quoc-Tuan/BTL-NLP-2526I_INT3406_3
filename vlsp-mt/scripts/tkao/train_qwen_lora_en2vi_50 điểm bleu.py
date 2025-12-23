@@ -5,12 +5,13 @@ import torch
 import random
 import numpy as np
 from datasets import Dataset
+from dataclasses import dataclass
+from typing import Any, Dict, List
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM, 
     TrainingArguments, 
     Trainer,
-    DataCollatorForSeq2Seq,
     EarlyStoppingCallback,
     GenerationConfig
 )
@@ -18,7 +19,32 @@ from peft import LoraConfig, get_peft_model
 import evaluate
 
 
+@dataclass
+class CausalLMCollator:
+    """
+    Custom collator cho Causal LM: pad labels bằng -100 (ignore index).
+    DataCollatorWithPadding pad labels bằng pad_token_id → model học loss trên pad tokens.
+    """
+    tokenizer: Any
+    pad_to_multiple_of: int = 8
 
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # Pad input_ids + attention_mask
+        batch = self.tokenizer.pad(
+            [{"input_ids": f["input_ids"], "attention_mask": f["attention_mask"]} for f in features],
+            padding=True,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors="pt",
+        )
+        # Pad labels với -100 (ignore loss trên pad tokens)
+        max_len = batch["input_ids"].size(1)
+        labels = []
+        for f in features:
+            lab = list(f["labels"])
+            lab = lab + [-100] * (max_len - len(lab))
+            labels.append(lab)
+        batch["labels"] = torch.tensor(labels, dtype=torch.long)
+        return batch
 
 
 def set_seed(seed):
@@ -56,28 +82,35 @@ def tokenize_example(example, tokenizer, direction, max_len):
     """
     Tokenize source-target pair with proper label masking.
     Only compute loss on target tokens, not prompt.
-    FIX: Tính lại prompt_len sau khi truncate để tránh label bị lệch.
+    FIX: Truncate prompt để chừa chỗ cho target tối thiểu 32 tokens.
     """
     src, tgt = example["src"], example["tgt"]
     prompt = build_prompt_en2vi(src) if direction == "en2vi" else build_prompt_vi2en(src)
     
-    # 1. Tokenize riêng lẻ (không truncate ở đây)
-    prompt_ids = tokenizer(prompt, add_special_tokens=True)["input_ids"]
+    # 1. Tokenize prompt với truncation để chừa chỗ cho target
+    min_target_space = 32
+    prompt_ids = tokenizer(
+        prompt, 
+        add_special_tokens=True,
+        truncation=True,
+        max_length=max_len - min_target_space
+    )["input_ids"]
+    
+    # 2. Tokenize target
     target_ids = tokenizer(
         " " + tgt + tokenizer.eos_token, 
         add_special_tokens=False
     )["input_ids"]
     
-    # 2. Ghép và truncate nếu cần
+    # 3. Ghép và truncate tổng thể nếu cần
     input_ids = prompt_ids + target_ids
     if len(input_ids) > max_len:
         input_ids = input_ids[:max_len]
     
-    # 3. Tính lại prompt_len thực tế sau khi cắt (QUAN TRỌNG!)
-    # Prompt nằm ở đầu nên thường không bị cắt, trừ khi max_len quá bé
+    # 4. Tính lại prompt_len thực tế sau khi cắt
     real_prompt_len = min(len(prompt_ids), len(input_ids))
     
-    # 4. Tạo Labels: -100 cho prompt (no loss), giữ nguyên target
+    # 5. Tạo Labels: -100 cho prompt (no loss), giữ nguyên target
     labels = [-100] * real_prompt_len + input_ids[real_prompt_len:]
     
     # Attention mask
@@ -135,14 +168,9 @@ class NEFTuneTrainer(Trainer):
         
         def neftune_hook(module, input, output):
             if module.training:
-                # Output shape: [batch, seq_len, hidden]
-                # Dùng tensor để tránh lỗi device sync
-                dims = torch.tensor(
-                    output.size(1) * output.size(2), 
-                    device=output.device,
-                    dtype=output.dtype
-                )
-                mag_norm = neftune_alpha / torch.sqrt(dims)
+                # FIX: Tối ưu - không dùng tensor cho phép tính đơn giản
+                seq_len, hidden = output.size(1), output.size(2)
+                mag_norm = neftune_alpha / (seq_len * hidden) ** 0.5
                 noise = torch.zeros_like(output).uniform_(-1, 1) * mag_norm
                 output = output + noise
             return output
@@ -167,7 +195,7 @@ class NEFTuneTrainer(Trainer):
 
 
 class BLEUEvalMixin:
-    """Mixin class for BLEU evaluation functionality."""
+    """Mixin class for BLEU/chrF evaluation functionality."""
     
     def _get_tokenizer(self):
         """Get tokenizer compatible with different transformers versions."""
@@ -176,27 +204,28 @@ class BLEUEvalMixin:
         return self.tokenizer
     
     def _compute_bleu(self):
-        """Generate translations and compute BLEU."""
+        """Generate translations and compute BLEU + chrF."""
         self.model.eval()
         tokenizer = self._get_tokenizer()
         
-        # Sample subset để tính BLEU (tránh quá lâu)
-        n_samples = min(self.bleu_sample_size, len(self.eval_src_texts))
-        indices = random.sample(range(len(self.eval_src_texts)), n_samples)
-        
-        src_samples = [self.eval_src_texts[i] for i in indices]
-        tgt_samples = [self.eval_tgt_texts[i] for i in indices]
+        # Dùng fixed indices thay vì random mỗi lần
+        src_samples = [self.eval_src_texts[i] for i in self.metric_indices]
+        tgt_samples = [self.eval_tgt_texts[i] for i in self.metric_indices]
         
         predictions = []
         build_prompt = build_prompt_en2vi if self.direction == "en2vi" else build_prompt_vi2en
         
+        # Save/restore padding_side để không ảnh hưởng chỗ khác
+        old_padding_side = tokenizer.padding_side
+        
         # Generate từng batch nhỏ
-        batch_size = 8
+        batch_size = 4  # Smaller batch for stability
         for i in range(0, len(src_samples), batch_size):
             batch_src = src_samples[i:i+batch_size]
             batch_prompts = [build_prompt(s) for s in batch_src]
             
-            # Tokenize
+            # Tokenize với left padding cho generation
+            tokenizer.padding_side = "left"
             inputs = tokenizer(
                 batch_prompts, 
                 return_tensors="pt", 
@@ -210,49 +239,76 @@ class BLEUEvalMixin:
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=self.gen_max_len,
-                    do_sample=False,  # Greedy for consistency
+                    do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                 )
             
-            # Decode - chỉ lấy phần generated (bỏ prompt)
+            # Decode - dùng attention_mask để tính prompt_len chính xác
             for j, output in enumerate(outputs):
-                prompt_len = inputs.input_ids[j].shape[0]
+                # Số token thực (không pad) = sum của attention_mask
+                prompt_len = inputs.attention_mask[j].sum().item()
                 generated = output[prompt_len:]
                 text = tokenizer.decode(generated, skip_special_tokens=True).strip()
                 predictions.append(text)
+        
+        # Restore padding_side
+        tokenizer.padding_side = old_padding_side
         
         # Compute BLEU
         references = [[ref] for ref in tgt_samples]
         bleu_result = self.bleu_metric.compute(predictions=predictions, references=references)
         bleu_score = bleu_result["bleu"] * 100
         
-        return bleu_score
+        # Compute chrF (ổn định hơn cho vi/en)
+        chrf_score = None
+        if self.chrf_metric:
+            chrf_result = self.chrf_metric.compute(predictions=predictions, references=references)
+            chrf_score = chrf_result["score"]  # chrF đã là 0-100
+        
+        return bleu_score, chrf_score
 
 
 class BLEUEvalTrainer(Trainer, BLEUEvalMixin):
-    """Trainer with BLEU evaluation during training."""
+    """Trainer with BLEU/chrF evaluation during training."""
     
     def __init__(self, eval_src_texts=None, eval_tgt_texts=None, 
-                 direction="en2vi", bleu_metric=None, gen_max_len=128,
-                 bleu_sample_size=200, **kwargs):
+                 direction="en2vi", bleu_metric=None, chrf_metric=None,
+                 gen_max_len=128, bleu_sample_size=200, metric_seed=1234, **kwargs):
         super().__init__(**kwargs)
         self.eval_src_texts = list(eval_src_texts) if eval_src_texts else []
         self.eval_tgt_texts = list(eval_tgt_texts) if eval_tgt_texts else []
         self.direction = direction
         self.bleu_metric = bleu_metric
+        self.chrf_metric = chrf_metric
         self.gen_max_len = gen_max_len
         self.bleu_sample_size = bleu_sample_size
+        
+        # Fixed indices để metric không nhảy loạn giữa các lần eval
+        if self.eval_src_texts:
+            n_samples = min(bleu_sample_size, len(self.eval_src_texts))
+            self.metric_indices = list(range(len(self.eval_src_texts)))
+            random.Random(metric_seed).shuffle(self.metric_indices)
+            self.metric_indices = self.metric_indices[:n_samples]
+        else:
+            self.metric_indices = []
     
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        # Gọi evaluate gốc để lấy loss
+        # Gọi evaluate gốc của Trainer để lấy loss
         output = Trainer.evaluate(self, eval_dataset, ignore_keys, metric_key_prefix)
         
-        # Tính BLEU nếu có data
+        # Tính BLEU + chrF nếu có data (chỉ để theo dõi, không dùng cho best model)
         if self.eval_src_texts and self.eval_tgt_texts and self.bleu_metric:
-            bleu_score = self._compute_bleu()
-            output[f"{metric_key_prefix}_bleu"] = bleu_score
-            print(f"\n>>> BLEU Score: {bleu_score:.2f}")
+            try:
+                bleu_score, chrf_score = self._compute_bleu()
+                output[f"{metric_key_prefix}_bleu"] = bleu_score
+                print(f"\n>>> BLEU: {bleu_score:.2f}", end="")
+                if chrf_score is not None:
+                    output[f"{metric_key_prefix}_chrf"] = chrf_score
+                    print(f" | chrF: {chrf_score:.2f}", end="")
+                print()
+            except Exception as e:
+                print(f"\n[WARNING] Metric computation failed: {e}")
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -261,22 +317,32 @@ class BLEUEvalTrainer(Trainer, BLEUEvalMixin):
 
 
 class NEFTuneBLEUTrainer(Trainer, BLEUEvalMixin):
-    """Combined NEFTune + BLEU evaluation trainer."""
+    """Combined NEFTune + BLEU/chrF evaluation trainer."""
     
     def __init__(self, neftune_noise_alpha=5.0, eval_src_texts=None, eval_tgt_texts=None,
-                 direction="en2vi", bleu_metric=None, gen_max_len=128,
-                 bleu_sample_size=200, **kwargs):
+                 direction="en2vi", bleu_metric=None, chrf_metric=None,
+                 gen_max_len=128, bleu_sample_size=200, metric_seed=1234, **kwargs):
         super().__init__(**kwargs)
         # NEFTune params
         self.neftune_noise_alpha = neftune_noise_alpha
         self._neftune_hook_handle = None
-        # BLEU params
+        # BLEU/chrF params
         self.eval_src_texts = list(eval_src_texts) if eval_src_texts else []
         self.eval_tgt_texts = list(eval_tgt_texts) if eval_tgt_texts else []
         self.direction = direction
         self.bleu_metric = bleu_metric
+        self.chrf_metric = chrf_metric
         self.gen_max_len = gen_max_len
         self.bleu_sample_size = bleu_sample_size
+        
+        # Fixed indices để metric không nhảy loạn giữa các lần eval
+        if self.eval_src_texts:
+            n_samples = min(bleu_sample_size, len(self.eval_src_texts))
+            self.metric_indices = list(range(len(self.eval_src_texts)))
+            random.Random(metric_seed).shuffle(self.metric_indices)
+            self.metric_indices = self.metric_indices[:n_samples]
+        else:
+            self.metric_indices = []
     
     def _setup_neftune_hook(self):
         if self._neftune_hook_handle is not None:
@@ -287,12 +353,9 @@ class NEFTuneBLEUTrainer(Trainer, BLEUEvalMixin):
         
         def neftune_hook(module, input, output):
             if module.training:
-                dims = torch.tensor(
-                    output.size(1) * output.size(2), 
-                    device=output.device,
-                    dtype=output.dtype
-                )
-                mag_norm = neftune_alpha / torch.sqrt(dims)
+                # Tối ưu - không dùng tensor cho phép tính đơn giản
+                seq_len, hidden = output.size(1), output.size(2)
+                mag_norm = neftune_alpha / (seq_len * hidden) ** 0.5
                 noise = torch.zeros_like(output).uniform_(-1, 1) * mag_norm
                 output = output + noise
             return output
@@ -309,15 +372,21 @@ class NEFTuneBLEUTrainer(Trainer, BLEUEvalMixin):
                 self._neftune_hook_handle = None
     
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        """Override evaluate to compute BLEU and clear cache."""
-        # Gọi evaluate của Trainer
+        # Gọi evaluate gốc của Trainer
         output = Trainer.evaluate(self, eval_dataset, ignore_keys, metric_key_prefix)
         
-        # Tính BLEU nếu có data
+        # Tính BLEU + chrF nếu có data (chỉ để theo dõi, không dùng cho best model)
         if self.eval_src_texts and self.eval_tgt_texts and self.bleu_metric:
-            bleu_score = self._compute_bleu()
-            output[f"{metric_key_prefix}_bleu"] = bleu_score
-            print(f"\n>>> BLEU Score: {bleu_score:.2f}")
+            try:
+                bleu_score, chrf_score = self._compute_bleu()
+                output[f"{metric_key_prefix}_bleu"] = bleu_score
+                print(f"\n>>> BLEU: {bleu_score:.2f}", end="")
+                if chrf_score is not None:
+                    output[f"{metric_key_prefix}_chrf"] = chrf_score
+                    print(f" | chrF: {chrf_score:.2f}", end="")
+                print()
+            except Exception as e:
+                print(f"\n[WARNING] Metric computation failed: {e}")
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -355,7 +424,7 @@ def main():
     p.add_argument("--batch_size", type=int, default=4, help="Per-device batch size")
     p.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps")
     p.add_argument("--epochs", type=int, default=2, help="Number of epochs (2 recommended for NEFTune)")
-    p.add_argument("--warmup_ratio", type=float, default=0.005, help="Warmup ratio")
+    p.add_argument("--warmup_ratio", type=float, default=0.03, help="Warmup ratio")
     p.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     p.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
     p.add_argument("--eval_steps", type=int, default=1000, 
@@ -412,19 +481,14 @@ def main():
     num_added_toks = 0
     if args.medical_vocab:
         if os.path.isfile(args.medical_vocab):
+            # Load từ file txt (mỗi dòng 1 từ)
             print(f"Loading medical vocabulary from: {args.medical_vocab}")
             with open(args.medical_vocab, encoding="utf8") as f:
-                new_tokens = []
-                for line in f:
-                    t = line.strip()
-                    # bỏ dòng trống + comment/header
-                    if not t or t.startswith("#"):
-                        continue
-                    new_tokens.append(t)
+                new_tokens = [line.strip() for line in f if line.strip()]
         else:
             print(f"[WARNING] Medical vocab file not found: {args.medical_vocab}")
             new_tokens = []
-
+        
         if new_tokens:
             num_added_toks = tokenizer.add_tokens(new_tokens)
             if num_added_toks > 0:
@@ -432,7 +496,6 @@ def main():
                 print(f"[INFO] New vocab size: {len(tokenizer)}")
             else:
                 print("[INFO] All medical tokens already exist in vocabulary.")
-
 
     # ============================================================
     # Load model
@@ -597,21 +660,21 @@ def main():
         logging_first_step=True,
         
         # Saving & Evaluation - ĐỒNG BỘ để load_best_model hoạt động đúng
-        save_strategy="steps",
+        save_strategy="steps" if eval_tokenized else "steps",
         save_steps=eval_save_steps,
-        save_total_limit=2,  # Tiết kiệm ổ cứng: chỉ giữ 2 checkpoint gần nhất
+        save_total_limit=5,  # Giữ 5 checkpoint để không mất best model
         eval_strategy="steps" if eval_tokenized else "no",
         eval_steps=eval_save_steps if eval_tokenized else None,
         load_best_model_at_end=True if eval_tokenized else False,
         # LUÔN dùng eval_loss để chọn best model (ổn định hơn BLEU)
         # BLEU chỉ để theo dõi, không dùng cho early stopping
-        metric_for_best_model="eval_bleu" if (eval_tokenized and args.eval_bleu) else ("eval_loss" if eval_tokenized else None),
-        greater_is_better=True if args.eval_bleu else False,  # BLEU cao = tốt, loss thấp = tốt
+        metric_for_best_model="eval_loss" if eval_tokenized else None,
+        greater_is_better=False,  # loss thấp = tốt
         
         # Performance optimizations for A100
-        dataloader_num_workers=12,
+        dataloader_num_workers=4,  # Giảm từ 12 xuống 4 để tránh overhead
         dataloader_pin_memory=True,
-        dataloader_prefetch_factor=4,
+        dataloader_prefetch_factor=2,  # Giảm từ 4 xuống 2
         gradient_checkpointing=not args.no_grad_checkpoint,
         gradient_checkpointing_kwargs={"use_reentrant": False} if not args.no_grad_checkpoint else None,
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
@@ -635,25 +698,22 @@ def main():
         print(f"Early stopping enabled with patience={args.early_stopping_patience}")
 
     # ============================================================
-    # Data collator - use DataCollatorForSeq2Seq for dynamic padding
-    # This is more efficient than static padding to max_len
+    # Data collator - CausalLMCollator pad labels bằng -100
+    # DataCollatorWithPadding pad labels bằng pad_token_id → sai!
     # ============================================================
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        padding=True,
-        pad_to_multiple_of=8,  # Tensor core optimization
-        return_tensors="pt"
-    )
+    data_collator = CausalLMCollator(tokenizer=tokenizer, pad_to_multiple_of=8)
 
 
     # ============================================================
     # Trainer
     # ============================================================
-    # Load BLEU metric nếu cần
+    # Load metrics nếu cần
     bleu_metric = None
+    chrf_metric = None
     if args.eval_bleu and eval_tokenized:
-        print("Loading BLEU metric for evaluation...")
+        print("Loading BLEU + chrF metrics for evaluation...")
         bleu_metric = evaluate.load("bleu")
+        chrf_metric = evaluate.load("chrf")  # chrF ổn định hơn cho vi/en
     
     trainer_kwargs = dict(
         model=model,
@@ -671,23 +731,25 @@ def main():
     
     if use_neftune and use_bleu:
         print(f"NEFTune enabled with alpha={args.neftune_alpha}")
-        print(f"BLEU evaluation enabled (sample_size={args.bleu_sample_size})")
+        print(f"BLEU + chrF evaluation enabled (sample_size={args.bleu_sample_size})")
         trainer = NEFTuneBLEUTrainer(
             neftune_noise_alpha=args.neftune_alpha,
             eval_src_texts=eval_src_texts,
             eval_tgt_texts=eval_tgt_texts,
             direction=args.direction,
             bleu_metric=bleu_metric,
+            chrf_metric=chrf_metric,
             bleu_sample_size=args.bleu_sample_size,
             **trainer_kwargs
         )
     elif use_bleu:
-        print(f"BLEU evaluation enabled (sample_size={args.bleu_sample_size})")
+        print(f"BLEU + chrF evaluation enabled (sample_size={args.bleu_sample_size})")
         trainer = BLEUEvalTrainer(
             eval_src_texts=eval_src_texts,
             eval_tgt_texts=eval_tgt_texts,
             direction=args.direction,
             bleu_metric=bleu_metric,
+            chrf_metric=chrf_metric,
             bleu_sample_size=args.bleu_sample_size,
             **trainer_kwargs
         )

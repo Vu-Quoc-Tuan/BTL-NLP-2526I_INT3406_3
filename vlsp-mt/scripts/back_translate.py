@@ -77,6 +77,50 @@ def extract_translation(full_text: str, src_text: str) -> str:
 
     # 4. Chuẩn hóa khoảng trắng (xóa \n thừa)
     return " ".join(text.split())
+
+
+def is_good_translation(src: str, tgt: str) -> bool:
+    """
+    Filter để loại bỏ back-translation kém chất lượng.
+    Returns True nếu translation ok, False nếu nên bỏ.
+    """
+    # 1. Quá ngắn
+    if len(tgt.split()) < 3:
+        return False
+    
+    # 2. Quá dài so với source (có thể bị lặp)
+    len_ratio = len(tgt) / max(len(src), 1)
+    if len_ratio > 3.0 or len_ratio < 0.2:
+        return False
+    
+    # 3. Lặp lại source (copy nguyên văn)
+    if src.lower().strip() == tgt.lower().strip():
+        return False
+    
+    # 4. Chứa quá nhiều từ giống source (>80% overlap)
+    src_words = set(src.lower().split())
+    tgt_words = set(tgt.lower().split())
+    if len(src_words) > 0:
+        overlap = len(src_words & tgt_words) / len(src_words)
+        if overlap > 0.8:
+            return False
+    
+    # 5. Chứa các pattern lỗi phổ biến
+    bad_patterns = [
+        "i cannot", "i can't", "sorry", "as an ai",
+        "không thể dịch", "xin lỗi", "tôi không",
+    ]
+    tgt_lower = tgt.lower()
+    for pattern in bad_patterns:
+        if pattern in tgt_lower:
+            return False
+    
+    # 6. Toàn số hoặc ký tự đặc biệt
+    alpha_ratio = sum(c.isalpha() for c in tgt) / max(len(tgt), 1)
+    if alpha_ratio < 0.5:
+        return False
+    
+    return True
     
 
 def main():
@@ -92,6 +136,8 @@ def main():
                    help="Sampling temperature (higher = more diverse)")
     p.add_argument("--num_samples", type=int, default=1,
                    help="Number of translations per sentence (for diversity)")
+    p.add_argument("--filter", action="store_true",
+                   help="Filter out bad translations")
     args = p.parse_args()
 
     # ============================================================
@@ -189,7 +235,12 @@ def main():
             # [FIX] Truyền src_text thay vì prompt vào extract_translation
             for full_text, src_text in zip(gen_texts, batch):
                 hyp = extract_translation(full_text, src_text)
-                translations.append(hyp)
+                
+                # Filter nếu bật --filter
+                if args.filter and not is_good_translation(src_text, hyp):
+                    hyp = ""  # Mark as bad, sẽ filter sau
+                
+                translations.append((src_text, hyp))
         
         all_translations.append(translations)
 
@@ -197,10 +248,25 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     
     if args.num_samples == 1:
+        # Filter out empty translations (bad ones)
+        good_pairs = [(src, tgt) for src, tgt in all_translations[0] if tgt.strip()]
+        
+        # Save translations
         with open(args.output, "w", encoding="utf8") as f:
-            for t in all_translations[0]:
-                f.write(t + "\n")
-        print(f"\nSaved {len(all_translations[0])} translations to {args.output}")
+            for _, tgt in good_pairs:
+                f.write(tgt + "\n")
+        
+        # Save corresponding source (for pairing)
+        src_output = args.output.replace(".en", ".src.vi").replace(".vi", ".src.en")
+        if src_output != args.output:
+            with open(src_output, "w", encoding="utf8") as f:
+                for src, _ in good_pairs:
+                    f.write(src + "\n")
+        
+        filtered_count = len(all_translations[0]) - len(good_pairs)
+        print(f"\nSaved {len(good_pairs)} translations to {args.output}")
+        if filtered_count > 0:
+            print(f"Filtered out {filtered_count} bad translations ({filtered_count/len(all_translations[0])*100:.1f}%)")
     else:
         # Save multiple samples
         for idx, translations in enumerate(all_translations):

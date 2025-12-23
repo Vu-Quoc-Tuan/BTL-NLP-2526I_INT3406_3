@@ -30,28 +30,14 @@ def build_prompt_vi2en(src):
     )
 
 
-def sentence_reward(hyp, ref, alpha=0.3, beta=0.4, gamma=0.3):
-    """
-    Compute reward as weighted combination of BLEU, chrF, and chrF++.
-    Giảm weight BLEU vì sentence-level BLEU rất noisy.
-    chrF ổn định hơn cho translation.
-    """
+def sentence_reward(hyp, ref, alpha=0.5, beta=0.3, gamma=0.2):
+    """Compute reward as weighted combination of BLEU, chrF, and chrF++."""
     if not hyp.strip():
         return 0.0
-    
-    # Length penalty: phạt nếu quá ngắn hoặc quá dài so với ref
-    len_ratio = len(hyp) / max(len(ref), 1)
-    if len_ratio < 0.5 or len_ratio > 2.0:
-        length_penalty = 0.8
-    else:
-        length_penalty = 1.0
-    
     bleu = sacrebleu.sentence_bleu(hyp, [ref], smooth_method='exp').score / 100.0
     chrf = sacrebleu.sentence_chrf(hyp, [ref]).score / 100.0
     chrf_pp = sacrebleu.sentence_chrf(hyp, [ref], word_order=2).score / 100.0
-    
-    reward = alpha * bleu + beta * chrf + gamma * chrf_pp
-    return reward * length_penalty
+    return alpha * bleu + beta * chrf + gamma * chrf_pp
 
 
 def batch_sentence_rewards(hyps, refs, alpha=0.5, beta=0.3, gamma=0.2):
@@ -180,13 +166,13 @@ def main():
     p.add_argument("--alpha", type=float, default=0.5, help="BLEU weight in reward")
     p.add_argument("--beta", type=float, default=0.3, help="chrF weight in reward")
     p.add_argument("--gamma", type=float, default=0.2, help="chrF++ weight in reward")
-    p.add_argument("--kl_coef", type=float, default=0.1, help="KL penalty coefficient (0.1 recommended)")
-    p.add_argument("--lr", type=float, default=1e-6)
+    p.add_argument("--kl_coef", type=float, default=0.02, help="KL penalty coefficient")
+    p.add_argument("--lr", type=float, default=3e-6)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--grad_accum_steps", type=int, default=8)
+    p.add_argument("--grad_accum_steps", type=int, default=4)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--max_new_tokens", type=int, default=96)  # Tăng từ 64
-    p.add_argument("--temperature", type=float, default=0.4)
+    p.add_argument("--max_new_tokens", type=int, default=64)
+    p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--baseline_decay", type=float, default=0.99)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--log_interval", type=int, default=10)
@@ -200,7 +186,7 @@ def main():
     # Fallback về base model nếu adapter không có tokenizer
     tokenizer_path = args.sft_adapter
     try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False, local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False)
         print(f"Loaded tokenizer from adapter: {tokenizer_path}")
     except Exception:
         print(f"No tokenizer in adapter, loading from base model: {args.model_name}")
@@ -236,8 +222,8 @@ def main():
         attn_implementation=attn_impl,
     )
     
-    # Resize embeddings nếu tokenizer có vocab khác base model (medical vocab)
-    if len(tokenizer) != base_model.config.vocab_size:
+    # Resize embeddings nếu tokenizer có thêm medical tokens
+    if len(tokenizer) > base_model.config.vocab_size:
         print(f"Resizing embeddings: {base_model.config.vocab_size} -> {len(tokenizer)}")
         base_model.resize_token_embeddings(len(tokenizer))
 
@@ -292,7 +278,6 @@ def main():
     build_prompt = build_prompt_en2vi if args.direction == "en2vi" else build_prompt_vi2en
     baseline = 0.0
     global_step = 0
-    best_reward = 0.0  # Track best reward để save best model
 
     # ============================================================
     # Training Loop
@@ -330,14 +315,14 @@ def main():
                     **inputs,
                     do_sample=True,
                     temperature=args.temperature,
-                    top_p=0.95,
-                    top_k=30,  # Giảm từ 50 để ít random hơn
+                    top_p=0.9,
+                    top_k=50,
                     max_new_tokens=args.max_new_tokens,
-                    min_new_tokens=5,  # Tăng từ 1 để tránh output quá ngắn
+                    min_new_tokens=1,  # Tránh empty generation
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     use_cache=True,
-                    repetition_penalty=1.15,  # Tăng từ 1.1
+                    repetition_penalty=1.1,
                 )
 
             # Robust Decoding: Slice tensor theo input_width thay vì string split
@@ -419,19 +404,8 @@ def main():
 
                 if global_step % args.save_interval == 0:
                     ckpt_dir = os.path.join(run_dir, f"checkpoint-{global_step}")
-                    # Chỉ save policy adapter (đã train), không save reference
-                    model.save_pretrained(ckpt_dir, selected_adapters=["policy"])
-                    tokenizer.save_pretrained(ckpt_dir)
+                    model.save_pretrained(ckpt_dir)
                     print(f"\nSaved checkpoint to {ckpt_dir}")
-                    
-                    # Save best model nếu reward cao hơn
-                    recent_reward = sum(epoch_rewards[-200:]) / max(len(epoch_rewards[-200:]), 1)
-                    if recent_reward > best_reward:
-                        best_reward = recent_reward
-                        best_dir = os.path.join(run_dir, "best_model")
-                        model.save_pretrained(best_dir, selected_adapters=["policy"])
-                        tokenizer.save_pretrained(best_dir)
-                        print(f">>> New best model! Reward: {best_reward:.4f}")
 
             # Clear cache periodically to prevent memory buildup
             if batch_idx % 50 == 0:
@@ -441,13 +415,10 @@ def main():
         if epoch_rewards:
             print(f"\nEpoch {epoch+1} avg reward: {sum(epoch_rewards)/len(epoch_rewards):.4f}")
 
-        model.save_pretrained(os.path.join(run_dir, f"epoch-{epoch+1}"), selected_adapters=["policy"])
-        tokenizer.save_pretrained(os.path.join(run_dir, f"epoch-{epoch+1}"))
+        model.save_pretrained(os.path.join(run_dir, f"epoch-{epoch+1}"))
 
-    # Final save - chỉ save policy adapter
-    final_dir = os.path.join(run_dir, "final_model")
-    model.save_pretrained(final_dir, selected_adapters=["policy"])
-    tokenizer.save_pretrained(final_dir)
+    # Final save
+    model.save_pretrained(os.path.join(run_dir, "final_model"))
     print(f"\nRL training completed!")
 
 
