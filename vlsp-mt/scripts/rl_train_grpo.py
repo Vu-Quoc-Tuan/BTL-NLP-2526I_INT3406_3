@@ -207,8 +207,17 @@ def get_logprobs_batch_vectorized(model, tokenizer, prompts, gen_texts, device, 
         total_skipped += num_skipped
         
         # 4. Forward Pass
+        # QUAN TRỌNG: Với gradient checkpointing, cần enable gradient cho embeddings
+        # để PyTorch có thể backprop qua checkpointed layers
+        inputs_embeds = model.get_input_embeddings()(input_ids)
+        inputs_embeds.requires_grad_(True)
+        
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            outputs = model(input_ids, attention_mask=attention_mask, return_dict=True)
+            outputs = model(
+                inputs_embeds=inputs_embeds, 
+                attention_mask=attention_mask, 
+                return_dict=True
+            )
         
         # 5. Dùng cross_entropy thay vì log_softmax + gather (tiết kiệm RAM)
         # Shift: logits[t] dự đoán input[t+1]
@@ -399,8 +408,9 @@ def main():
     model.train()
     
     # Enable gradient checkpointing to save VRAM
-    model.gradient_checkpointing_enable()
-    print("Gradient checkpointing enabled")
+    # QUAN TRỌNG: use_reentrant=False để tương thích với LoRA
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    print("Gradient checkpointing enabled (use_reentrant=False)")
 
     # Get trainable params (only policy adapter)
     trainable_params = [
