@@ -21,6 +21,27 @@ from peft import PeftModel
 from tqdm import tqdm
 
 
+def parse_hf_path(path):
+    """
+    Parse HuggingFace path với subfolder.
+    Input: 'user/repo/subfolder/path' hoặc 'local/path'
+    Output: (repo_id, subfolder) hoặc (local_path, None)
+    """
+    # Nếu là local path
+    if os.path.exists(path):
+        return path, None
+    
+    # Nếu là HF path với subfolder (có nhiều hơn 2 phần)
+    parts = path.split('/')
+    if len(parts) > 2:
+        repo_id = '/'.join(parts[:2])  # user/repo
+        subfolder = '/'.join(parts[2:])  # subfolder/path
+        return repo_id, subfolder
+    
+    # HF path không có subfolder
+    return path, None
+
+
 def build_prompt(src: str, direction: str) -> str:
     """ChatML format for Qwen2.5."""
     if direction == "vi2en":
@@ -144,8 +165,16 @@ def main():
     # Load tokenizer - thử từ adapter trước, fallback về base model
     # ============================================================
     print(f"Loading tokenizer from adapter: {args.adapter_path}")
+    adapter_repo, adapter_subfolder = parse_hf_path(args.adapter_path)
     try:
-        tokenizer = AutoTokenizer.from_pretrained(args.adapter_path, use_fast=False, local_files_only=True)
+        if adapter_subfolder:
+            tokenizer = AutoTokenizer.from_pretrained(
+                adapter_repo, 
+                subfolder=adapter_subfolder,
+                use_fast=False
+            )
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(adapter_repo, use_fast=False, local_files_only=True)
         print(f"Loaded tokenizer from adapter (may include medical vocab)")
     except Exception:
         print(f"Tokenizer not found in adapter, loading from base model: {args.model_name}")
@@ -188,7 +217,8 @@ def main():
     
     # Load adapter
     print(f"Loading adapter from: {args.adapter_path}")
-    model = PeftModel.from_pretrained(base, args.adapter_path)
+    adapter_repo, adapter_subfolder = parse_hf_path(args.adapter_path)
+    model = PeftModel.from_pretrained(base, adapter_repo, subfolder=adapter_subfolder)
     model.eval()
     device = next(model.parameters()).device
 

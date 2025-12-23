@@ -8,6 +8,27 @@ import sacrebleu
 from tqdm import tqdm
 
 
+def parse_hf_path(path):
+    """
+    Parse HuggingFace path với subfolder.
+    Input: 'user/repo/subfolder/path' hoặc 'local/path'
+    Output: (repo_id, subfolder) hoặc (local_path, None)
+    """
+    # Nếu là local path
+    if os.path.exists(path):
+        return path, None
+    
+    # Nếu là HF path với subfolder (có nhiều hơn 2 phần)
+    parts = path.split('/')
+    if len(parts) > 2:
+        repo_id = '/'.join(parts[:2])  # user/repo
+        subfolder = '/'.join(parts[2:])  # subfolder/path
+        return repo_id, subfolder
+    
+    # HF path không có subfolder
+    return path, None
+
+
 def build_prompt_en2vi(src):
     """ChatML format for Qwen2.5 - English to Vietnamese translation."""
     return (
@@ -198,10 +219,19 @@ def main():
 
     # Load tokenizer từ SFT adapter (đã có medical tokens nếu đã thêm)
     # Fallback về base model nếu adapter không có tokenizer
-    tokenizer_path = args.sft_adapter
+    sft_repo, sft_subfolder = parse_hf_path(args.sft_adapter)
     try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False, local_files_only=True)
-        print(f"Loaded tokenizer from adapter: {tokenizer_path}")
+        if sft_subfolder:
+            from huggingface_hub import hf_hub_download
+            # Download tokenizer files từ subfolder
+            tokenizer = AutoTokenizer.from_pretrained(
+                sft_repo, 
+                subfolder=sft_subfolder,
+                use_fast=False
+            )
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(sft_repo, use_fast=False, local_files_only=True)
+        print(f"Loaded tokenizer from adapter: {args.sft_adapter}")
     except Exception:
         print(f"No tokenizer in adapter, loading from base model: {args.model_name}")
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
@@ -243,16 +273,19 @@ def main():
 
     # Load policy adapter (trainable) - this becomes the "default" adapter
     print(f"Loading policy adapter from: {args.init_adapter}")
+    init_repo, init_subfolder = parse_hf_path(args.init_adapter)
     model = PeftModel.from_pretrained(
         base_model, 
-        args.init_adapter, 
+        init_repo, 
+        subfolder=init_subfolder,
         adapter_name="policy",
         is_trainable=True
     )
     
     # Load reference adapter (frozen) onto the SAME base model
     print(f"Loading reference adapter from: {args.sft_adapter}")
-    model.load_adapter(args.sft_adapter, adapter_name="reference")
+    sft_repo, sft_subfolder = parse_hf_path(args.sft_adapter)
+    model.load_adapter(sft_repo, subfolder=sft_subfolder, adapter_name="reference")
     
     # Freeze reference adapter
     for name, param in model.named_parameters():
