@@ -5,6 +5,11 @@ Mô hình được lưu trữ trên Hugging Face, có thể truy cập [tại đ
 
 Thông tin chi tiết về từng phần và cách chạy có thể xem thêm tại trong từng folder.
 
+## Môi trường huấn luyện
+Tất cả các mô hình đều được huấn luyện trên nền tảng **Google Colab** với cấu hình:
+- **GPU:** A100 (80GB VRAM)
+- **RAM:** High-RAM (167GB CPU RAM)
+
 ## Thành viên
 | Thành viên | Mã sinh viên |
 | --- | --- |
