@@ -143,105 +143,125 @@ def load_dataset(src_path, tgt_path):
     return list(zip(src, tgt))
 
 
-def get_logprobs_batch_vectorized(model, tokenizer, prompts, gen_texts, device):
+def get_logprobs_batch_vectorized(model, tokenizer, prompts, gen_texts, device, mini_batch_size=8):
     """
     gom lại các sample thành 1 batch và chạy
     tự động skip sample nếu mismatch
-    toekn ko hđ theo kiểu công chuỗi -> phát hiện Tokenizer merge -> skip
+    Sử dụng mini-batch để tránh OOM
     
     Returns:
         avg_log_probs: tensor [batch_size] - average log prob per token
         stats: dict with 'skip_rate' and 'avg_gen_len' for debugging
     """
-    batch_size = len(prompts)
+    total_samples = len(prompts)
+    all_avg_log_probs = []
+    total_skipped = 0
+    total_gen_len = 0
     
-    # Tách kwargs: prompt không cần truncation, full text thì có
-    prompt_kwargs = {
-        "return_tensors": "pt",
-        "padding": True,
-        "add_special_tokens": False
-    }
-    full_kwargs = {
-        "return_tensors": "pt",
-        "padding": True,
-        "truncation": True,
-        "max_length": 1024,
-        "add_special_tokens": False
-    }
-    
-    # 1. Tokenize PROMPTS (không truncate để prefix check chính xác)
-    prompt_encodings = tokenizer(prompts, **prompt_kwargs).to(device)
-    prompt_ids = prompt_encodings.input_ids
-    prompt_lens = prompt_encodings.attention_mask.sum(dim=1)
-    
-    # 2. Tokenize FULL TEXT (prompt + generation)
-    full_texts = [p + g for p, g in zip(prompts, gen_texts)]
-    full_encodings = tokenizer(full_texts, **full_kwargs).to(device)
-    input_ids = full_encodings.input_ids
-    attention_mask = full_encodings.attention_mask
-    
-    real_bs = input_ids.size(0)
-    
-    # 3. SAFETY CHECK: Prefix Matching + Track skipped samples
-    num_skipped = 0
-    original_prompt_lens = prompt_lens.clone()
-    
-    for i in range(real_bs):
-        p_len = int(prompt_lens[i].item())
-        full_len = int(attention_mask[i].sum().item())
+    # Process in mini-batches to avoid OOM
+    for start_idx in range(0, total_samples, mini_batch_size):
+        end_idx = min(start_idx + mini_batch_size, total_samples)
+        batch_prompts = prompts[start_idx:end_idx]
+        batch_gen_texts = gen_texts[start_idx:end_idx]
         
-        # Check if prompt fits in full sequence
-        if p_len > full_len:
-            prompt_lens[i] = full_len
-            num_skipped += 1
-        elif not torch.equal(input_ids[i, :p_len], prompt_ids[i, :p_len]):
-            # MISMATCH detected: Skip mẫu này
-            prompt_lens[i] = full_len
-            num_skipped += 1
+        batch_size = len(batch_prompts)
+        
+        # Tách kwargs: prompt không cần truncation, full text thì có
+        prompt_kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+            "add_special_tokens": False
+        }
+        full_kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+            "truncation": True,
+            "max_length": 512,
+            "add_special_tokens": False
+        }
+        
+        # 1. Tokenize PROMPTS (không truncate để prefix check chính xác)
+        prompt_encodings = tokenizer(batch_prompts, **prompt_kwargs).to(device)
+        prompt_ids = prompt_encodings.input_ids
+        prompt_lens = prompt_encodings.attention_mask.sum(dim=1)
+        
+        # 2. Tokenize FULL TEXT (prompt + generation)
+        full_texts = [p + g for p, g in zip(batch_prompts, batch_gen_texts)]
+        full_encodings = tokenizer(full_texts, **full_kwargs).to(device)
+        input_ids = full_encodings.input_ids
+        attention_mask = full_encodings.attention_mask
+        
+        real_bs = input_ids.size(0)
+        
+        # 3. SAFETY CHECK: Prefix Matching + Track skipped samples
+        num_skipped = 0
+        
+        for i in range(real_bs):
+            p_len = int(prompt_lens[i].item())
+            full_len = int(attention_mask[i].sum().item())
+            
+            # Check if prompt fits in full sequence
+            if p_len > full_len:
+                prompt_lens[i] = full_len
+                num_skipped += 1
+            elif not torch.equal(input_ids[i, :p_len], prompt_ids[i, :p_len]):
+                # MISMATCH detected: Skip mẫu này
+                prompt_lens[i] = full_len
+                num_skipped += 1
+        
+        total_skipped += num_skipped
+        
+        # 4. Forward Pass
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            outputs = model(input_ids, attention_mask=attention_mask, return_dict=True)
+            logits = outputs.logits.float()
+        
+        # 5. Log Softmax & Shift
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        
+        # Shift: logits[t] dự đoán input[t+1]
+        shift_log_probs = log_probs[:, :-1, :]
+        shift_labels = input_ids[:, 1:]
+        
+        # Gather logprob của token thực tế
+        token_log_probs = torch.gather(
+            shift_log_probs, 2, shift_labels.unsqueeze(-1)
+        ).squeeze(-1)
+        
+        # 6. Masking (Generation part only)
+        seq_len = token_log_probs.shape[1]
+        mask_indices = torch.arange(seq_len, device=device).expand(real_bs, seq_len)
+        
+        # Clamp min=0 để an toàn boundary
+        start_mask = (prompt_lens.unsqueeze(1) - 1).clamp(min=0)
+        end_mask = (attention_mask.sum(dim=1).unsqueeze(1) - 1).clamp(min=0)
+        
+        # Tạo mask: >= start và < end
+        gen_mask = (mask_indices >= start_mask) & (mask_indices < end_mask)
+        
+        # 7. Normalize (Average Logprob per token)
+        masked_log_probs = token_log_probs * gen_mask.float()
+        gen_lens = gen_mask.sum(dim=1).float()
+        gen_lens_clamped = torch.clamp(gen_lens, min=1.0)  # Avoid div 0
+        
+        avg_log_probs = masked_log_probs.sum(dim=1) / gen_lens_clamped
+        all_avg_log_probs.append(avg_log_probs)
+        total_gen_len += gen_lens.sum().item()
+        
+        # Clear intermediate tensors
+        del logits, log_probs, shift_log_probs, token_log_probs
     
-    # 4. Forward Pass
-    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-        outputs = model(input_ids, attention_mask=attention_mask, return_dict=True)
-        logits = outputs.logits.float()
-    
-    # 5. Log Softmax & Shift
-    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-    
-    # Shift: logits[t] dự đoán input[t+1]
-    shift_log_probs = log_probs[:, :-1, :]
-    shift_labels = input_ids[:, 1:]
-    
-    # Gather logprob của token thực tế
-    token_log_probs = torch.gather(
-        shift_log_probs, 2, shift_labels.unsqueeze(-1)
-    ).squeeze(-1)
-    
-    # 6. Masking (Generation part only)
-    seq_len = token_log_probs.shape[1]
-    mask_indices = torch.arange(seq_len, device=device).expand(real_bs, seq_len)
-    
-    # Clamp min=0 để an toàn boundary
-    start_mask = (prompt_lens.unsqueeze(1) - 1).clamp(min=0)
-    end_mask = (attention_mask.sum(dim=1).unsqueeze(1) - 1).clamp(min=0)
-    
-    # Tạo mask: >= start và < end
-    gen_mask = (mask_indices >= start_mask) & (mask_indices < end_mask)
-    
-    # 7. Normalize (Average Logprob per token)
-    masked_log_probs = token_log_probs * gen_mask.float()
-    gen_lens = gen_mask.sum(dim=1).float()
-    gen_lens_clamped = torch.clamp(gen_lens, min=1.0)  # Avoid div 0
-    
-    avg_log_probs = masked_log_probs.sum(dim=1) / gen_lens_clamped
+    # Concatenate all mini-batch results
+    final_log_probs = torch.cat(all_avg_log_probs, dim=0)
     
     # Stats for debugging
     stats = {
-        'skip_rate': num_skipped / real_bs if real_bs > 0 else 0.0,
-        'avg_gen_len': gen_lens.mean().item(),
-        'num_skipped': num_skipped
+        'skip_rate': total_skipped / total_samples if total_samples > 0 else 0.0,
+        'avg_gen_len': total_gen_len / total_samples if total_samples > 0 else 0.0,
+        'num_skipped': total_skipped
     }
     
-    return avg_log_probs, stats
+    return final_log_probs, stats
 
 
 def compute_group_advantages(rewards, group_size):
@@ -348,6 +368,7 @@ def main():
         args.model_name,
         trust_remote_code=True,
         device_map="auto",
+        low_cpu_mem_usage=True,
         torch_dtype=torch.bfloat16,
         attn_implementation=attn_impl,
     )
@@ -381,6 +402,10 @@ def main():
     # Set policy as active for training
     model.set_adapter("policy")
     model.train()
+    
+    # Enable gradient checkpointing to save VRAM
+    model.gradient_checkpointing_enable()
+    print("Gradient checkpointing enabled")
 
     # Get trainable params (only policy adapter)
     trainable_params = [
@@ -457,7 +482,7 @@ def main():
 
             # Use policy adapter for generation
             model.set_adapter("policy")
-            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 gen_outputs = model.generate(
                     **inputs,
                     do_sample=True,
