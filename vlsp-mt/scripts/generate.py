@@ -135,6 +135,12 @@ ASSISTANT_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE
 )
 
+# Pattern đơn giản hơn: tìm "assistant" cuối cùng (không cần special tokens)
+SIMPLE_ASSISTANT_PATTERN = re.compile(
+    r"assistant\s*\n?\s*(.*)$",
+    re.DOTALL | re.IGNORECASE
+)
+
 CLEANUP_FILLER = re.compile(
     r'^(?:Sure|Certainly|Of course|Okay|Ok|Yes|No problem)[!.,]?\s*',
     re.IGNORECASE
@@ -161,45 +167,18 @@ def extract_translation(full_text: str, src_text: str = None, direction: str = "
     """Extract translation from model output, handling both special token formats."""
     
     # 1) Tìm vị trí "assistant" cuối cùng và lấy text sau nó
-    # Handle cả format có <|im_start|> và không có
-    last = None
-    for m in ASSISTANT_PATTERN.finditer(full_text):
-        last = m
-    
-    if last:
-        hyp = last.group(1).strip()
+    # Dùng rfind để lấy assistant CUỐI CÙNG (không phải cái trong prompt)
+    assistant_idx = full_text.lower().rfind("assistant")
+    if assistant_idx != -1:
+        # Lấy phần sau "assistant" + có thể có newline
+        hyp = full_text[assistant_idx + len("assistant"):].strip()
+        # Bỏ newline đầu nếu có
+        hyp = hyp.lstrip('\n').strip()
     else:
-        # Fallback: tìm "assistant" keyword và lấy phần sau
-        assistant_idx = full_text.lower().rfind("assistant")
-        if assistant_idx != -1:
-            hyp = full_text[assistant_idx + len("assistant"):].strip()
-        else:
-            hyp = full_text.strip()
-
-    # 2) Source repetition (dynamic)
-    if src_text:
-        src_words = src_text.strip().split()
-        if src_words:
-            flexible_src_regex = r"\s+".join(re.escape(w) for w in src_words)
-            src_repetition_pattern = (
-                r'^(?:source|original|text|câu gốc|src)?\s*[:\-]?\s*'
-                + flexible_src_regex
-                + STRICT_SEPARATOR_STR
-            )
-            m2 = re.search(src_repetition_pattern, hyp, flags=re.IGNORECASE | re.DOTALL)
-            if m2:
-                hyp = hyp[m2.end():].strip()
-
-    # 3) Cleanup layered (lặp vài vòng để bắt "Sure! Here is the translation:")
-    for _ in range(3):
-        new = CLEANUP_FILLER.sub('', hyp)
-        new = CLEANUP_INTRO.sub('', new)
-        if new == hyp:
-            break
-        hyp = new
-
-    # 4) Stop markers (earliest cut)
-    stop_markers = ["<|im_end|>", "<|endoftext|>", "<|im_start|>", "system", "user"]
+        hyp = full_text.strip()
+    
+    # 2) Cắt tại các stop markers
+    stop_markers = ["<|im_end|>", "<|endoftext|>", "<|im_start|>", "\nsystem", "\nuser", "System", "User"]
     if direction == "en2vi":
         stop_markers += ["\nEnglish:", "English:"]
     elif direction == "vi2en":
@@ -212,6 +191,28 @@ def extract_translation(full_text: str, src_text: str = None, direction: str = "
             cut_pos = idx if cut_pos is None else min(cut_pos, idx)
     if cut_pos is not None:
         hyp = hyp[:cut_pos]
+
+    # 3) Source repetition (dynamic) - nếu model lặp lại source
+    if src_text:
+        src_words = src_text.strip().split()
+        if src_words and len(src_words) <= 20:  # Chỉ check với source ngắn
+            flexible_src_regex = r"\s+".join(re.escape(w) for w in src_words[:10])
+            src_repetition_pattern = (
+                r'^(?:source|original|text|câu gốc|src)?\s*[:\-]?\s*'
+                + flexible_src_regex
+                + STRICT_SEPARATOR_STR
+            )
+            m2 = re.search(src_repetition_pattern, hyp, flags=re.IGNORECASE | re.DOTALL)
+            if m2:
+                hyp = hyp[m2.end():].strip()
+
+    # 4) Cleanup filler phrases
+    for _ in range(3):
+        new = CLEANUP_FILLER.sub('', hyp)
+        new = CLEANUP_INTRO.sub('', new)
+        if new == hyp:
+            break
+        hyp = new
 
     return " ".join(hyp.split())
 
@@ -324,9 +325,9 @@ def main():
     # Load tokenizer from adapter path first (may have extended vocab from training)
     # Fallback to base model if adapter doesn't have tokenizer
     try:
-        tokenizer = AutoTokenizer.from_pretrained(args.adapter_path, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(args.adapter_path, use_fast=False, local_files_only=True)
         print(f"Loaded tokenizer from adapter (may include medical vocab)")
-    except:
+    except Exception:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
         print(f"Loaded tokenizer from base model")
     

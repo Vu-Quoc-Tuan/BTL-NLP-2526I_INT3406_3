@@ -186,7 +186,7 @@ def main():
     # Fallback về base model nếu adapter không có tokenizer
     tokenizer_path = args.sft_adapter
     try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False, local_files_only=True)
         print(f"Loaded tokenizer from adapter: {tokenizer_path}")
     except Exception:
         print(f"No tokenizer in adapter, loading from base model: {args.model_name}")
@@ -404,7 +404,9 @@ def main():
 
                 if global_step % args.save_interval == 0:
                     ckpt_dir = os.path.join(run_dir, f"checkpoint-{global_step}")
-                    model.save_pretrained(ckpt_dir)
+                    # Chỉ save policy adapter (đã train), không save reference
+                    model.save_pretrained(ckpt_dir, selected_adapters=["policy"])
+                    tokenizer.save_pretrained(ckpt_dir)
                     print(f"\nSaved checkpoint to {ckpt_dir}")
 
             # Clear cache periodically to prevent memory buildup
@@ -415,10 +417,13 @@ def main():
         if epoch_rewards:
             print(f"\nEpoch {epoch+1} avg reward: {sum(epoch_rewards)/len(epoch_rewards):.4f}")
 
-        model.save_pretrained(os.path.join(run_dir, f"epoch-{epoch+1}"))
+        model.save_pretrained(os.path.join(run_dir, f"epoch-{epoch+1}"), selected_adapters=["policy"])
+        tokenizer.save_pretrained(os.path.join(run_dir, f"epoch-{epoch+1}"))
 
-    # Final save
-    model.save_pretrained(os.path.join(run_dir, "final_model"))
+    # Final save - chỉ save policy adapter
+    final_dir = os.path.join(run_dir, "final_model")
+    model.save_pretrained(final_dir, selected_adapters=["policy"])
+    tokenizer.save_pretrained(final_dir)
     print(f"\nRL training completed!")
 
 

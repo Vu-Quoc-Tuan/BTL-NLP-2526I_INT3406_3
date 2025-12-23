@@ -95,10 +95,16 @@ def main():
     args = p.parse_args()
 
     # ============================================================
-    # [FIX] Load tokenizer từ ADAPTER PATH (chứa medical vocab đã thêm)
+    # Load tokenizer - thử từ adapter trước, fallback về base model
     # ============================================================
     print(f"Loading tokenizer from adapter: {args.adapter_path}")
-    tokenizer = AutoTokenizer.from_pretrained(args.adapter_path, use_fast=False)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.adapter_path, use_fast=False, local_files_only=True)
+        print(f"Loaded tokenizer from adapter (may include medical vocab)")
+    except Exception:
+        print(f"Tokenizer not found in adapter, loading from base model: {args.model_name}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
+    
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
