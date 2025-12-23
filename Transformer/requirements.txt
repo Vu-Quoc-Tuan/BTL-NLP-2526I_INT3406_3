@@ -1,0 +1,7 @@
+torch
+tqdm
+regex
+pyyaml
+tokenizers>=0.13.3
+sacrebleu
+wandb

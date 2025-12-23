@@ -1,0 +1,36 @@
+model:
+  d_model: 512
+  n_layers: 6
+  heads: 8
+  dropout: 0.1
+  vocab_size: 32768 
+  max_len: 120 # Độ dài tối đa của câu sau khi tokenize. Nếu câu dài hơn sẽ bị cắt, ngắn hơn sẽ padding.
+
+
+training:
+  batch_size: 8
+  lr: 0.0001
+  epochs: 20
+  warmup_ratio: 0.07 # 7% steps
+  save_dir: "checkpoints"
+  log_dir: "logs"
+  seed: 42
+  num_workers: 4 # Tăng lên 4 hoặc 8 trên Colab để load dữ liệu nhanh hơn
+
+inference:
+  beam_size: 1 # Để mặc định là 1 (Greedy). Khi cần Beam Search thì tăng lên (vd: 5).
+  decoding_method: "greedy" # "greedy" hoặc "beam"
+  eval_batch_size: 32 # Batch size khi tính BLEU/Test
+  length_penalty: 0.6
+
+data:
+  min_len: 3
+  max_ratio: 2.0
+  bpe_dropout: 0.1
+
+wandb:
+  enabled: false # Bật lên TRUE để log vào WandB
+  project: "nlp-transformer-from-scratch"
+  entity: null # Điền username nếu cần
+  name: null # Tên run (để null sẽ tự sinh random)
+
